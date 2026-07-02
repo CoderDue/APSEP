@@ -1,0 +1,8 @@
+build/
+*.o
+*.a
+*.so
+*.ptx
+*.cubin
+*.fatbin
+apose_test
