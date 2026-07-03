@@ -1468,7 +1468,8 @@ __device__ void buildSuperBlockTreeFromLeaves(
 }
 
 template <typename T, int BLOCK_SIZE, int IPT, int K>
-__global__ void apsepKernelWarpScanLeaves(
+__global__
+void apsepKernelWarpScanLeaves(
         const T* __restrict__   d_in,
         int*                    d_out,
         int                     n,
@@ -1699,6 +1700,266 @@ void launchWarpScanLeaves(const T* d_in, int* d_out, int n) {
     runWarpScanLeaves<T, BLOCK_SIZE, IPT, K>(d_in, d_out, n, s);
     gpuAssert(cudaDeviceSynchronize());
     freeWarpScanLeavesScratch<T, BLOCK_SIZE, IPT, K>(s);
+}
+
+// ===========================================================================
+// WarpScanNoTree APSEP
+//
+// Like WarpScanLeaves but removes the SB min-tree entirely.  The inter-SB
+// decoupled look-back replaces tree traversal with:
+//   1. Check sb_min (one read, same as before)
+//   2. Scan K block_mins in that SB to find the rightmost matching block
+//   3. Linear scan of that block's B leaf values
+//
+// This eliminates the d_sb_trees allocation (saves ~32 KB × num_SBs) and
+// replaces O(log KB) pointer-chasing tree reads with sequential block_min +
+// leaf reads.  For large N where the SB tree working set doesn't fit in L2,
+// sequential access patterns enable hardware prefetching and reduce misses.
+// ===========================================================================
+
+template <typename T, int B, int K>
+__device__ int decoupledLookbackNoTree(
+        int                             sb_id,
+        T                               val,
+        const SuperBlockState<T>*       d_sb_states,
+        const BlockState<T>*            d_states,
+        const T* __restrict__           d_block_leaves,
+        int                             num_blocks) {
+    for (int sb = sb_id - 1; sb >= 0; sb--) {
+        while (d_sb_states[sb].status == APSEP_INVALID) { /* spin */ }
+        if (d_sb_states[sb].sb_min >= val) continue;
+
+        int sb_first = sb * K;
+        int sb_last  = min(sb_first + K, num_blocks) - 1;
+
+        // scan blocks right-to-left, skipping those whose block_min >= val
+        for (int b = sb_last; b >= sb_first; b--) {
+            if (d_states[b].block_min < val) {
+                const T* bl = d_block_leaves + (size_t)b * B;
+                for (int k = B - 1; k >= 0; k--)
+                    if (bl[k] < val) return b * B + k;
+            }
+        }
+    }
+    return -1;
+}
+
+template <typename T, int BLOCK_SIZE, int IPT, int K>
+__global__
+void apsepKernelWarpScanNoTree(
+        const T* __restrict__   d_in,
+        int*                    d_out,
+        int                     n,
+        int                     num_blocks,
+        int                     num_superblocks,
+        BlockState<T>*          d_states,
+        T* __restrict__         d_block_leaves,
+        SuperBlockState<T>*     d_sb_states,
+        volatile uint32_t*      d_dyn_idx) {
+
+    constexpr int B         = BLOCK_SIZE * IPT;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    const     T   INF       = ApsepInfinity<T>::value();
+
+    __shared__ uint32_t s_bid;
+    __shared__ T        s_elems[B];
+    __shared__ T        s_stripe_min[IPT][NUM_WARPS];
+
+    if (threadIdx.x == 0)
+        s_bid = atomicAdd(const_cast<uint32_t*>(d_dyn_idx), 1u);
+    __syncthreads();
+
+    const int block_id = (int)s_bid;
+    const int glb_offs = block_id * B;
+    const int sb_id    = block_id / K;
+    const int sb_local = block_id % K;
+    const int sb_first = sb_id * K;
+    const int lane     = threadIdx.x & 31;
+    const int warp_id  = threadIdx.x >> 5;
+
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) {
+        int lid = i * BLOCK_SIZE + threadIdx.x;
+        int gid = glb_offs + lid;
+        s_elems[lid] = (gid < n) ? d_in[gid] : INF;
+    }
+    __syncthreads();
+
+    T left_carry[IPT];
+    #pragma unroll
+    for (int ipt = 0; ipt < IPT; ipt++) {
+        T c = s_elems[ipt * BLOCK_SIZE + threadIdx.x];
+        #pragma unroll
+        for (int step = 1; step <= 16; step <<= 1) {
+            T nb = __shfl_up_sync(0xffffffff, c, step);
+            if (lane >= step) c = min(c, nb);
+        }
+        left_carry[ipt] = __shfl_up_sync(0xffffffff, c, 1);
+        T wm = __shfl_sync(0xffffffff, c, 31);
+        if (lane == 0) s_stripe_min[ipt][warp_id] = wm;
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int ipt = 0; ipt < IPT; ipt++) {
+        int lid = ipt * BLOCK_SIZE + threadIdx.x;
+        int gid = glb_offs + lid;
+        if (gid >= n) continue;
+        T val = s_elems[lid];
+        int result = -1;
+
+        if (lane > 0 && left_carry[ipt] < val) {
+            int base = ipt * BLOCK_SIZE + warp_id * 32;
+            for (int k = lane - 1; k >= 0; k--)
+                if (s_elems[base + k] < val) { result = base + k; break; }
+        }
+        if (result < 0) {
+            for (int w = warp_id - 1; w >= 0 && result < 0; w--) {
+                if (s_stripe_min[ipt][w] < val) {
+                    int wb = ipt * BLOCK_SIZE + w * 32;
+                    for (int k = 31; k >= 0; k--)
+                        if (s_elems[wb + k] < val) { result = wb + k; break; }
+                }
+            }
+        }
+        if (result < 0) {
+            for (int i = ipt - 1; i >= 0 && result < 0; i--) {
+                for (int w = NUM_WARPS - 1; w >= 0 && result < 0; w--) {
+                    if (s_stripe_min[i][w] < val) {
+                        int wb = i * BLOCK_SIZE + w * 32;
+                        for (int k = 31; k >= 0; k--)
+                            if (s_elems[wb + k] < val) { result = wb + k; break; }
+                    }
+                }
+            }
+        }
+        d_out[gid] = (result >= 0) ? (glb_offs + result) : INT_MIN;
+    }
+
+    // Publish B leaves
+    T* g_leaves = d_block_leaves + (size_t)block_id * B;
+    for (int i = threadIdx.x; i < B; i += BLOCK_SIZE)
+        g_leaves[i] = s_elems[i];
+    __threadfence();
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        T bmin = s_stripe_min[0][0];
+        for (int ipt = 0; ipt < IPT; ipt++)
+            for (int w = 0; w < NUM_WARPS; w++)
+                bmin = min(bmin, s_stripe_min[ipt][w]);
+        d_states[block_id].block_min = bmin;
+        __threadfence();
+        d_states[block_id].status = APSEP_READY;
+    }
+    __syncthreads();
+
+    // Last block in SB: wait for siblings, publish SB state (no tree build)
+    int sb_size = min(K, num_blocks - sb_first);
+    bool is_last_in_sb = (sb_local == sb_size - 1);
+
+    if (is_last_in_sb) {
+        for (int b = sb_first; b < block_id; b++)
+            while (d_states[b].status == APSEP_INVALID) { /* spin */ }
+
+        if (threadIdx.x == 0) {
+            T sb_min = d_states[sb_first].block_min;
+            for (int b = sb_first + 1; b <= block_id; b++)
+                sb_min = min(sb_min, d_states[b].block_min);
+            __threadfence();
+            d_sb_states[sb_id].sb_min = sb_min;
+            __threadfence();
+            d_sb_states[sb_id].status = APSEP_READY;
+        }
+    }
+    __syncthreads();
+
+    // Decoupled look-back (no tree)
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) {
+        int lid = i * BLOCK_SIZE + threadIdx.x;
+        int gid = glb_offs + lid;
+        if (gid < n && d_out[gid] == INT_MIN) {
+            T val = s_elems[lid];
+            int result = -1;
+
+            // Intra-SB: linear scan over earlier blocks' leaves
+            for (int b = block_id - 1; b >= sb_first && result < 0; b--) {
+                while (d_states[b].status == APSEP_INVALID) { /* spin */ }
+                if (d_states[b].block_min < val) {
+                    const T* bl = d_block_leaves + (size_t)b * B;
+                    for (int k = B - 1; k >= 0; k--)
+                        if (bl[k] < val) { result = b * B + k; break; }
+                }
+            }
+
+            // Inter-SB: scan block_mins + leaves (no tree)
+            if (result < 0)
+                result = decoupledLookbackNoTree<T, B, K>(
+                    sb_id, val, d_sb_states, d_states, d_block_leaves, num_blocks);
+
+            d_out[gid] = result;
+        }
+    }
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+struct ApsepWarpScanNoTreeScratch {
+    BlockState<T>*      d_states        = nullptr;
+    T*                  d_block_leaves  = nullptr;
+    SuperBlockState<T>* d_sb_states     = nullptr;
+    uint32_t*           d_dyn_idx       = nullptr;
+    int                 num_blocks      = 0;
+    int                 num_superblocks = 0;
+};
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+ApsepWarpScanNoTreeScratch<T, BLOCK_SIZE, IPT, K> allocWarpScanNoTreeScratch(int n) {
+    constexpr int B = BLOCK_SIZE * IPT;
+
+    ApsepWarpScanNoTreeScratch<T, BLOCK_SIZE, IPT, K> s;
+    s.num_blocks      = (n + B - 1) / B;
+    s.num_superblocks = (s.num_blocks + K - 1) / K;
+
+    gpuAssert(cudaMalloc(&s.d_states,       (size_t)s.num_blocks      * sizeof(BlockState<T>)));
+    gpuAssert(cudaMalloc(&s.d_block_leaves, (size_t)s.num_blocks      * B  * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_sb_states,    (size_t)s.num_superblocks * sizeof(SuperBlockState<T>)));
+    gpuAssert(cudaMalloc(&s.d_dyn_idx,      sizeof(uint32_t)));
+    return s;
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+void freeWarpScanNoTreeScratch(ApsepWarpScanNoTreeScratch<T, BLOCK_SIZE, IPT, K>& s) {
+    cudaFree(s.d_states);
+    cudaFree(s.d_block_leaves);
+    cudaFree(s.d_sb_states);
+    cudaFree(s.d_dyn_idx);
+    s = ApsepWarpScanNoTreeScratch<T, BLOCK_SIZE, IPT, K>{};
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+void runWarpScanNoTree(const T* d_in, int* d_out, int n,
+                       ApsepWarpScanNoTreeScratch<T, BLOCK_SIZE, IPT, K>& s) {
+    gpuAssert(cudaMemset(s.d_states,    0, (size_t)s.num_blocks      * sizeof(BlockState<T>)));
+    gpuAssert(cudaMemset(s.d_sb_states, 0, (size_t)s.num_superblocks * sizeof(SuperBlockState<T>)));
+    gpuAssert(cudaMemset(s.d_dyn_idx,   0, sizeof(uint32_t)));
+
+    apsepKernelWarpScanNoTree<T, BLOCK_SIZE, IPT, K>
+        <<<s.num_blocks, BLOCK_SIZE>>>(
+            d_in, d_out, n, s.num_blocks, s.num_superblocks,
+            s.d_states, s.d_block_leaves,
+            s.d_sb_states, s.d_dyn_idx);
+
+    gpuAssert(cudaGetLastError());
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+void launchWarpScanNoTree(const T* d_in, int* d_out, int n) {
+    if (n <= 0) return;
+    auto s = allocWarpScanNoTreeScratch<T, BLOCK_SIZE, IPT, K>(n);
+    runWarpScanNoTree<T, BLOCK_SIZE, IPT, K>(d_in, d_out, n, s);
+    gpuAssert(cudaDeviceSynchronize());
+    freeWarpScanNoTreeScratch<T, BLOCK_SIZE, IPT, K>(s);
 }
 
 // ===========================================================================

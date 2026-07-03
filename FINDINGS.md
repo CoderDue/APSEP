@@ -159,49 +159,131 @@ Combines two improvements over the baseline min-tree kernel:
    reads these leaves to build the merged SB tree.  Intra-SB look-back does a
    linear scan over stored leaves.
 
-**Effect on shared memory:** `3076 → 1060 bytes/block` (~3× reduction), enabling
-more concurrent blocks per SM and significantly improving occupancy.
+**Effect on shared memory:** `3076 → 1060 bytes/block` (IPT=2) or `3076 → 2116 bytes/block` (IPT=4).
+With 46 registers/block, occupancy is register-limited at 11 blocks/SM regardless.
+The shared-memory reduction mainly matters for larger IPT by reducing evictions.
 
-**K sweep results (BS=128, IPT=2, N=32M ints):**
+**IPT sweep (BS=128, K=8, N=32M ints):**
 
-| K | WarpScanLeaves GB/s | Baseline GB/s |
+| IPT | B | WarpScanLeaves GB/s |
 |---|---|---|
-| 1 | 17.0 | 13.5 |
-| 2 | 24.9 | 18.9 |
-| 4 | 33.5 | 23.8 |
-| 8 | 40.7 | 27.2 |
-| **16** | **43.6** | **27.1** |
-| 32 | 39.6 | 26.6 |
+| 1 | 128 | 17.0 |
+| 2 | 256 | 40.7 |
+| **4** | **512** | **46.3** |
+| 8 | 1024 | 28.5 |
 
-**Best configuration: WarpScanLeaves K=16 → 43.6 GB/s** (15.1% of peak).
+**K sweep results (BS=128, IPT=4, N=32M ints):**
 
-Cross-check with 500 MiB benchmark (bench_approaches, K=8): **26.8 GB/s** vs
-baseline 17.9 GB/s — consistent ~1.5× speedup at K=8 and even larger at K=16.
+| K | GB/s |
+|---|---|
+| 4 | 33.5 |
+| 8 | **46.3** |
+| 10 | 46.4 |
+| 12 | 45.3 |
+| 16 | 42.2 |
 
-The key insight: the shared memory bottleneck (not global memory traffic) was
-limiting occupancy.  Removing `s_tree[2*B]` allowed ~3× more blocks per SM,
-which better hides the serial look-back latency and keeps the memory subsystem
-busier.
+**Best configuration: WarpScanLeaves IPT=4, K=8 → 46+ GB/s** on N=32M ints.
+
+On production-size 500 MiB (N=131M ints, bench_approaches):
+
+| Config | GB/s |
+|---|---|
+| Baseline IPT=2 K=8 | 17.7 |
+| WarpScanLeaves IPT=2 K=8 | 26.7 |
+| **WarpScanLeaves IPT=4 K=8** | **30.5** |
+
+Note the throughput drop from 32M to 131M input: the SB tree working set no
+longer fits in L2 cache, making each inter-SB look-back step slower.
+
+Why IPT=4 wins: doubling B from 256→512 halves the number of serial look-back
+steps (each block handles 2× more elements, so the chain from first→last block
+has half as many links).  The per-step cost is the same, so half the steps = 2×
+less serial overhead.
+
+**Optimizations tried and rejected:**
+
+- `__ballot_sync` backward search: fundamentally cannot work — each thread
+  searches for its own `val`, so the ballot condition differs per lane.  No
+  single ballot call can answer all threads' queries simultaneously.  Attempted
+  a uniform-loop variant that always executes ballot across all lanes; correctness
+  failure confirmed the approach is wrong.
+
+- `__launch_bounds__(128, 13)`: reduced IPT=4 from 46→44 registers but the
+  compiler spills registers, costing ~0.6 GB/s.  Not beneficial.
+
+---
+
+### 6. WarpScanNoTree kernel (new best)
+
+Eliminates the per-superblock min-tree (`d_sb_trees`) entirely.  The inter-SB
+decoupled look-back is replaced by:
+
+1. Check `sb_min` from `d_sb_states` (same as before — one read).
+2. If `sb_min < val`: iterate `K` block_mins in that SB to find the rightmost
+   matching block (K reads from `d_states`, sequential).
+3. Linear scan of that block's B leaf values to find the exact position.
+
+**Why the tree was a bottleneck:** for N=131M with K=8, B=512, the SB tree is
+32 KB per SB (2×KB×4 bytes), and there are ~32K SBs → 1 GB total tree data.
+The L2 cache on GTX 1660 Ti is only 1.5 MB, so every inter-SB tree traversal
+is an L2 miss.  The traversal itself does O(log KB) = 12 pointer-chasing hops
+through this cold data.
+
+**The no-tree approach** reads K block_mins (sequential, warm) + B leaves
+(burst of 512 ints, hardware-prefetcher-friendly).  The access pattern is
+entirely sequential rather than pointer-chasing, allowing the GPU memory
+subsystem to hide latency.
+
+**Key insight**: with the tree gone, larger K is no longer penalized by larger
+tree build/read costs.  K can now be increased to reduce the serial SB chain
+length much more aggressively.
+
+**K sweep (BS=128, IPT=4, N=32M ints):**
+
+| K | WarpScanNoTree GB/s | WarpScanLeaves GB/s |
+|---|---|---|
+| 8 | 44.0 | 46.3 |
+| 16 | 50.3 | 42.0 |
+| 32 | 53.8 | — |
+| 64 | 55.4 | — |
+| **128** | **55.6** | — |
+| 256 | 55.4 | — |
+
+**Best configuration: WarpScanNoTree IPT=4, K=128 → 55.6 GB/s** (N=32M).
+
+On production-size 500 MiB (N=131M ints, bench_approaches):
+
+| Config | GB/s |
+|---|---|
+| Baseline IPT=2 K=8 | 16.8 |
+| WarpScanLeaves IPT=2 K=8 | 26.8 |
+| WarpScanLeaves IPT=4 K=8 | 30.4 |
+| **WarpScanNoTree IPT=4 K=128** | **37.2** |
+
+With K=128 and B=512, there are N/(K×B) = 131M/65536 ≈ 2K serial SB chain
+steps, each requiring only K+B = 640 sequential int reads instead of 12 L2-cold
+tree hops.
 
 ---
 
 ## Summary table
 
-| Kernel | GB/s | Serial steps | Notes |
-|---|---|---|---|
-| Warp-scan (intra-block only) | 107 | — | No inter-block answer |
-| Min-tree K=1 | 8.7 | 512K | Baseline end-to-end |
-| Stack look-back K=1 | 8.0 | 512K | Compact stack; worse than tree |
-| Two-pass suffix-stack | 5.8 | — | O(N) pass-2 scan per element |
-| Segmented scan (CUB) | 9.2 | — | Two passes; MergeOp overhead |
-| Min-tree K=8 (baseline) | 17.4 | 64K | After intra-SB bug fix |
-| LeavesOnly K=8 | 16.7 | 64K | Saves N write bytes; no SM gain |
-| NoBlockTree K=8 | 16.7 | 64K | Same as LeavesOnly |
-| WarpScanLeaves K=8 | 26.8 | 64K | Shared memory cut 3×; 1.5× faster |
-| **WarpScanLeaves K=16** | **43.6** | 32K | **Best: occupancy + fewer steps** |
-| Persistent-thread | ~0 | 192 × chunk | Effectively serial |
+| Kernel | GB/s (N=32M) | GB/s (N=131M) | Serial steps | Notes |
+|---|---|---|---|---|
+| Warp-scan (intra-block only) | 107 | — | — | No inter-block answer |
+| Min-tree K=1 | 8.7 | — | 512K | Baseline end-to-end |
+| Stack look-back K=1 | 8.0 | — | 512K | Compact stack; worse than tree |
+| Two-pass suffix-stack | — | 5.8 | — | O(N) pass-2 scan per element |
+| Segmented scan (CUB) | — | 9.2 | — | Two passes; MergeOp overhead |
+| Min-tree K=8 (baseline) | 17.4 | 16.8 | 64K | After intra-SB bug fix |
+| LeavesOnly K=8 | 16.7 | 16.7 | 64K | Saves N write bytes; no SM gain |
+| NoBlockTree K=8 | 16.7 | 16.7 | 64K | Same as LeavesOnly |
+| WarpScanLeaves K=8 | 46.3 | 30.4 | 64K | Warp-scan + leaves-only |
+| WarpScanLeaves K=16 | 43.6 | — | 32K | IPT=2; prior "best" |
+| **WarpScanNoTree K=128** | **55.6** | **37.2** | **2K** | **No SB tree; sequential reads** |
+| Persistent-thread | ~0 | ~0 | 192×chunk | Effectively serial |
 
-WarpScanLeaves K=16 at **43.6 GB/s** is the best single-pass result (15.1% of
-peak, ~6.7× serialization).  The remaining gap to peak is inherent to the
-serial dependency chain in APSEP — no single-pass algorithm can close it without
-a fundamentally different aggregate structure.
+**WarpScanNoTree K=128** at **55.6 GB/s** (N=32M) / **37.2 GB/s** (N=131M) is
+the best single-pass result (19.3% of peak at N=32M).  The remaining gap to peak
+is inherent to the serial dependency chain in APSEP — no single-pass algorithm
+can close it without a fundamentally different aggregate structure.

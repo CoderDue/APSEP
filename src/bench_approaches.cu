@@ -583,7 +583,13 @@ int main() {
         bool ok = stressTest("warp-scan-leaves", [](const int* di, int* dout, int n){
             launchWarpScanLeaves<int,128,2,8>(di, dout, n);
         }, 200, 8192, 5);
-        printf("  WarpScanLeaves (K=8):              %s\n", ok?"PASS":"FAIL");
+        printf("  WarpScanLeaves IPT=2 (K=8):        %s\n", ok?"PASS":"FAIL");
+    });
+    timedSection("wsl-ipt4 stress (200 trials)", [&]{
+        bool ok = stressTest("wsl-ipt4", [](const int* di, int* dout, int n){
+            launchWarpScanLeaves<int,128,4,8>(di, dout, n);
+        }, 200, 8192, 7);
+        printf("  WarpScanLeaves IPT=4 (K=8):        %s\n", ok?"PASS":"FAIL");
     });
 
     timedSection("no-block-tree stress (200 trials)", [&]{
@@ -673,9 +679,15 @@ int main() {
     });
     timedSection("warp-scan-leaves bench (random)", [&]{
         auto s = allocWarpScanLeavesScratch<int,128,2,8>(N);
-        BENCH("WarpScanLeaves: K=8",
+        BENCH("WarpScanLeaves: IPT=2 K=8",
               ([&]{ runWarpScanLeaves<int,128,2,8>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
         freeWarpScanLeavesScratch<int,128,2,8>(s);
+    });
+    timedSection("wsl-ipt4 bench (random)", [&]{
+        auto s = allocWarpScanLeavesScratch<int,128,4,8>(N);
+        BENCH("WarpScanLeaves: IPT=4 K=8  (best)",
+              ([&]{ runWarpScanLeaves<int,128,4,8>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeWarpScanLeavesScratch<int,128,4,8>(s);
     });
     timedSection("no-block-tree bench (random)", [&]{
         auto s = allocNoBlockTreeScratch<int,128,2,8>(N);
@@ -683,7 +695,12 @@ int main() {
               ([&]{ runNoBlockTree<int,128,2,8>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
         freeNoBlockTreeScratch<int,128,2,8>(s);
     });
-
+    timedSection("wsnt-ipt4-k128 bench (random)", [&]{
+        auto s = allocWarpScanNoTreeScratch<int,128,4,128>(N);
+        BENCH("WarpScanNoTree: IPT=4 K=128 (new best?)",
+              ([&]{ runWarpScanNoTree<int,128,4,128>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeWarpScanNoTreeScratch<int,128,4,128>(s);
+    });
 
     cudaFree(d_in); cudaFree(d_out);
     return 0;
