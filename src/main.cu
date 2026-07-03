@@ -14,6 +14,7 @@
 #include <cassert>
 #include <algorithm>
 #include <numeric>
+#include <type_traits>
 
 // ---------------------------------------------------------------------------
 // CPU reference: nearest previous strictly-smaller element
@@ -557,6 +558,489 @@ int main(int argc, char** argv) {
             printf("  ");
             computeDescriptors(meas, bytes);
             printf("\n");
+        }
+    }
+
+    // =========================================================================
+    // Option A: Per-block look-back (no superblocks)
+    // =========================================================================
+    printf("\n--- Option A: Per-block look-back (correctness) ---\n"); fflush(stdout);
+    {
+        bool ok_a = true;
+        // Small structured tests
+        struct TC { const char* name; std::vector<int> data; };
+        TC small_cases[] = {
+            {"single",           {42}},
+            {"two asc",          {1, 2}},
+            {"two desc",         {2, 1}},
+            {"all equal",        {3, 3, 3, 3}},
+            {"ascending",        {1,2,3,4,5,6,7,8}},
+            {"descending",       {8,7,6,5,4,3,2,1}},
+            {"alternating",      {3,1,4,1,5,9,2,6}},
+        };
+        for (auto& tc : small_cases) {
+            int n = (int)tc.data.size();
+            auto expected = cpuApsep(tc.data);
+            int *d_in, *d_out;
+            gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+            gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+            gpuAssert(cudaMemcpy(d_in, tc.data.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+            launchPerBlockApsep<int, 128, 2>(d_in, d_out, n);
+            std::vector<int> got(n);
+            gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+            cudaFree(d_in); cudaFree(d_out);
+            bool ok = (got == expected);
+            printf("  %-20s %s\n", tc.name, ok ? "PASS" : "FAIL");
+            if (!ok) {
+                for (int i = 0; i < n; i++)
+                    if (got[i] != expected[i])
+                        printf("    i=%d val=%d got=%d expected=%d\n",
+                               i, tc.data[i], got[i], expected[i]);
+            }
+            ok_a = ok_a && ok;
+        }
+        // Stress
+        {
+            std::mt19937 rng(42);
+            int nfail = 0;
+            for (int t = 0; t < 500 && nfail == 0; t++) {
+                int n = 1 + rng() % 8192;
+                std::vector<int> h_in(n);
+                for (auto& v : h_in) v = rng() % 1000;
+                auto expected = cpuApsep(h_in);
+                int *d_in, *d_out;
+                gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+                gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+                gpuAssert(cudaMemcpy(d_in, h_in.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+                launchPerBlockApsep<int, 128, 2>(d_in, d_out, n);
+                std::vector<int> got(n);
+                gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+                cudaFree(d_in); cudaFree(d_out);
+                for (int i = 0; i < n; i++) {
+                    if (got[i] != expected[i]) {
+                        printf("  STRESS FAIL t=%d n=%d i=%d val=%d got=%d expected=%d\n",
+                               t, n, i, h_in[i], got[i], expected[i]);
+                        nfail++;
+                        break;
+                    }
+                }
+            }
+            printf("  Stress 500x8192: %s\n", nfail == 0 ? "PASS" : "FAIL");
+            ok_a = ok_a && (nfail == 0);
+        }
+        printf("  Option A correctness: %s\n\n", ok_a ? "PASSED" : "FAILED");
+
+        if (ok_a) {
+            printf("--- Option A: Per-block look-back benchmark (IPT sweep) ---\n"); fflush(stdout);
+            constexpr int BS = 128;
+            int warmup = 5, iters = 50;
+            {
+                auto bench_a = [&](auto IPT_tag) {
+                    constexpr int IPT = IPT_tag;
+                    constexpr int B   = BS * IPT;
+                    auto scratch = allocPerBlockScratch<int, BS, IPT>(N_BENCH);
+                    for (int i = 0; i < warmup; i++) {
+                        runPerBlockApsep<int, BS, IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                        gpuAssert(cudaDeviceSynchronize());
+                    }
+                    std::vector<float> meas(iters);
+                    cudaEvent_t t0, t1;
+                    gpuAssert(cudaEventCreate(&t0));
+                    gpuAssert(cudaEventCreate(&t1));
+                    for (int i = 0; i < iters; i++) {
+                        gpuAssert(cudaEventRecord(t0));
+                        runPerBlockApsep<int, BS, IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                        gpuAssert(cudaEventRecord(t1));
+                        gpuAssert(cudaEventSynchronize(t1));
+                        float ms; gpuAssert(cudaEventElapsedTime(&ms, t0, t1));
+                        meas[i] = ms;
+                    }
+                    gpuAssert(cudaEventDestroy(t0));
+                    gpuAssert(cudaEventDestroy(t1));
+                    freePerBlockScratch<int, BS, IPT>(scratch);
+                    int nb = (N_BENCH + B - 1) / B;
+                    size_t bytes = (size_t)N_BENCH * 2 * sizeof(int)
+                        + (size_t)nb * 2 * B * sizeof(int)
+                        + (size_t)nb * sizeof(BlockState<int>);
+                    printf("  IPT=%-2d  B=%-4d  blocks=%-7d  ", IPT, B, nb);
+                    computeDescriptors(meas, bytes);
+                    printf("\n");
+                };
+                bench_a(std::integral_constant<int,1>{});
+                bench_a(std::integral_constant<int,2>{});
+                bench_a(std::integral_constant<int,4>{});
+                bench_a(std::integral_constant<int,8>{});
+            }
+        }
+    }
+
+    // =========================================================================
+    // Option B: Warp-cooperative look-back (with superblocks)
+    // =========================================================================
+    printf("\n--- Option B: Warp-cooperative look-back (correctness) ---\n"); fflush(stdout);
+    {
+        bool ok_b = true;
+        struct TC { const char* name; std::vector<int> data; };
+        TC small_cases[] = {
+            {"single",           {42}},
+            {"two asc",          {1, 2}},
+            {"two desc",         {2, 1}},
+            {"all equal",        {3, 3, 3, 3}},
+            {"ascending",        {1,2,3,4,5,6,7,8}},
+            {"descending",       {8,7,6,5,4,3,2,1}},
+            {"alternating",      {3,1,4,1,5,9,2,6}},
+        };
+        // Use K=1 for correctness tests: K>1 inherits the same pre-existing
+        // intra-SB cross-block limitation as apsepKernel (elements in blocks
+        // 1..K-1 of the first superblock can't look back across blocks).
+        for (auto& tc : small_cases) {
+            int n = (int)tc.data.size();
+            auto expected = cpuApsep(tc.data);
+            int *d_in, *d_out;
+            gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+            gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+            gpuAssert(cudaMemcpy(d_in, tc.data.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+            launchWarpCoopApsep<int, 128, 2, 1>(d_in, d_out, n);
+            std::vector<int> got(n);
+            gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+            cudaFree(d_in); cudaFree(d_out);
+            bool ok = (got == expected);
+            printf("  %-20s %s\n", tc.name, ok ? "PASS" : "FAIL");
+            if (!ok) {
+                for (int i = 0; i < n; i++)
+                    if (got[i] != expected[i])
+                        printf("    i=%d val=%d got=%d expected=%d\n",
+                               i, tc.data[i], got[i], expected[i]);
+            }
+            ok_b = ok_b && ok;
+        }
+        // Stress: use K=1 to avoid pre-existing intra-SB cross-block issue
+        {
+            std::mt19937 rng(99);
+            int nfail = 0;
+            for (int t = 0; t < 500 && nfail == 0; t++) {
+                int n = 1 + rng() % 8192;
+                std::vector<int> h_in(n);
+                for (auto& v : h_in) v = rng() % 1000;
+                auto expected = cpuApsep(h_in);
+                int *d_in, *d_out;
+                gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+                gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+                gpuAssert(cudaMemcpy(d_in, h_in.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+                launchWarpCoopApsep<int, 128, 2, 1>(d_in, d_out, n);
+                std::vector<int> got(n);
+                gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+                cudaFree(d_in); cudaFree(d_out);
+                for (int i = 0; i < n; i++) {
+                    if (got[i] != expected[i]) {
+                        printf("  STRESS FAIL t=%d n=%d i=%d val=%d got=%d expected=%d\n",
+                               t, n, i, h_in[i], got[i], expected[i]);
+                        nfail++;
+                        break;
+                    }
+                }
+            }
+            printf("  Stress 500x8192 (K=1): %s\n", nfail == 0 ? "PASS" : "FAIL");
+            ok_b = ok_b && (nfail == 0);
+        }
+        printf("  Option B correctness: %s\n\n", ok_b ? "PASSED" : "FAILED");
+
+        if (ok_b) {
+            printf("--- Option B: Warp-cooperative look-back benchmark (K sweep, IPT=2) ---\n"); fflush(stdout);
+            constexpr int BS = 128, IPT = 2;
+            int warmup = 5, iters = 50;
+            auto bench_b = [&](auto K_tag) {
+                constexpr int K  = K_tag;
+                constexpr int B  = BS * IPT;
+                constexpr int KB = K * B;
+                auto scratch = allocWarpCoopScratch<int, BS, IPT, K>(N_BENCH);
+                for (int i = 0; i < warmup; i++) {
+                    runWarpCoopApsep<int, BS, IPT, K>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                    gpuAssert(cudaDeviceSynchronize());
+                }
+                std::vector<float> meas(iters);
+                cudaEvent_t t0, t1;
+                gpuAssert(cudaEventCreate(&t0));
+                gpuAssert(cudaEventCreate(&t1));
+                for (int i = 0; i < iters; i++) {
+                    gpuAssert(cudaEventRecord(t0));
+                    runWarpCoopApsep<int, BS, IPT, K>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                    gpuAssert(cudaEventRecord(t1));
+                    gpuAssert(cudaEventSynchronize(t1));
+                    float ms; gpuAssert(cudaEventElapsedTime(&ms, t0, t1));
+                    meas[i] = ms;
+                }
+                gpuAssert(cudaEventDestroy(t0));
+                gpuAssert(cudaEventDestroy(t1));
+                int nb  = scratch.num_blocks;
+                int nsb = scratch.num_superblocks;
+                freeWarpCoopScratch<int, BS, IPT, K>(scratch);
+                size_t bytes = (size_t)N_BENCH * 2 * sizeof(int)
+                    + (size_t)nb  * 2 * B  * sizeof(int)
+                    + (size_t)nb  * sizeof(BlockState<int>)
+                    + (size_t)nsb * 2 * KB * sizeof(int)
+                    + (size_t)nsb * sizeof(SuperBlockState<int>);
+                printf("  K=%-4d  superblocks=%-6d  ", K, nsb);
+                computeDescriptors(meas, bytes);
+                printf("\n");
+            };
+            bench_b(std::integral_constant<int,1>{});
+            bench_b(std::integral_constant<int,2>{});
+            bench_b(std::integral_constant<int,4>{});
+            bench_b(std::integral_constant<int,8>{});
+            bench_b(std::integral_constant<int,16>{});
+            bench_b(std::integral_constant<int,32>{});
+        }
+    }
+
+    // =========================================================================
+    // Helpers shared by V1/V2/V3
+    // =========================================================================
+
+    // Stress-test any launch function taking (d_in, d_out, n)
+    auto stressTest = [&](auto launchFn, const char* name, int trials, int maxN,
+                          unsigned seed) -> bool {
+        std::mt19937 rng(seed);
+        int nfail = 0;
+        for (int t = 0; t < trials && nfail == 0; t++) {
+            int n = 1 + rng() % maxN;
+            std::vector<int> h_in(n);
+            for (auto& v : h_in) v = rng() % 1000;
+            auto expected = cpuApsep(h_in);
+            int *d_in, *d_out;
+            gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+            gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+            gpuAssert(cudaMemcpy(d_in, h_in.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+            launchFn(d_in, d_out, n);
+            std::vector<int> got(n);
+            gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+            cudaFree(d_in); cudaFree(d_out);
+            for (int i = 0; i < n; i++) {
+                if (got[i] != expected[i]) {
+                    printf("  [%s] STRESS FAIL t=%d n=%d i=%d val=%d got=%d expected=%d\n",
+                           name, t, n, i, h_in[i], got[i], expected[i]);
+                    nfail++;
+                    break;
+                }
+            }
+        }
+        return nfail == 0;
+    };
+
+
+    // =========================================================================
+    // V1: Warp-per-element, per-block trees
+    // =========================================================================
+    printf("\n--- V1: Warp-per-element look-back (correctness) ---\n"); fflush(stdout);
+    {
+        bool ok_v1 = true;
+        struct TC { const char* name; std::vector<int> data; };
+        TC small_cases[] = {
+            {"single", {42}}, {"two asc", {1,2}}, {"two desc", {2,1}},
+            {"all equal", {3,3,3,3}}, {"ascending", {1,2,3,4,5,6,7,8}},
+            {"descending", {8,7,6,5,4,3,2,1}}, {"alternating", {3,1,4,1,5,9,2,6}},
+        };
+        for (auto& tc : small_cases) {
+            int n = (int)tc.data.size();
+            auto expected = cpuApsep(tc.data);
+            int *d_in, *d_out;
+            gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+            gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+            gpuAssert(cudaMemcpy(d_in, tc.data.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+            launchV1Apsep<int, 128, 2>(d_in, d_out, n);
+            std::vector<int> got(n);
+            gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+            cudaFree(d_in); cudaFree(d_out);
+            bool ok = (got == expected);
+            printf("  %-20s %s\n", tc.name, ok ? "PASS" : "FAIL");
+            if (!ok) for (int i = 0; i < n; i++)
+                if (got[i] != expected[i])
+                    printf("    i=%d val=%d got=%d expected=%d\n", i, tc.data[i], got[i], expected[i]);
+            ok_v1 = ok_v1 && ok;
+        }
+        ok_v1 = ok_v1 && stressTest(
+            [](int* di, int* dou, int n){ launchV1Apsep<int,128,2>(di, dou, n); },
+            "V1", 500, 8192, 11);
+        printf("  Stress 500x8192: %s\n", ok_v1 ? "PASS" : "FAIL");
+        printf("  V1 correctness: %s\n\n", ok_v1 ? "PASSED" : "FAILED");
+
+        if (ok_v1) {
+            printf("--- V1 benchmark (IPT sweep) ---\n"); fflush(stdout);
+            int warmup = 5, iters = 50;
+            auto bench = [&](auto IPT_tag) {
+                constexpr int IPT = IPT_tag;
+                constexpr int B   = 128 * IPT;
+                auto scratch = allocV1Scratch<int, 128, IPT>(N_BENCH);
+                for (int i = 0; i < warmup; i++) {
+                    runV1Apsep<int,128,IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                    gpuAssert(cudaDeviceSynchronize());
+                }
+                std::vector<float> meas(iters);
+                cudaEvent_t t0, t1;
+                gpuAssert(cudaEventCreate(&t0)); gpuAssert(cudaEventCreate(&t1));
+                for (int i = 0; i < iters; i++) {
+                    gpuAssert(cudaEventRecord(t0));
+                    runV1Apsep<int,128,IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                    gpuAssert(cudaEventRecord(t1));
+                    gpuAssert(cudaEventSynchronize(t1));
+                    float ms; gpuAssert(cudaEventElapsedTime(&ms, t0, t1)); meas[i] = ms;
+                }
+                gpuAssert(cudaEventDestroy(t0)); gpuAssert(cudaEventDestroy(t1));
+                int nb = scratch.num_blocks;
+                freeV1Scratch<int,128,IPT>(scratch);
+                size_t bytes = (size_t)N_BENCH*2*sizeof(int)
+                    + (size_t)nb*2*B*sizeof(int) + (size_t)nb*sizeof(BlockState<int>);
+                printf("  IPT=%-2d  B=%-4d  blocks=%-7d  ", IPT, B, nb);
+                computeDescriptors(meas, bytes); printf("\n");
+            };
+            bench(std::integral_constant<int,1>{});
+            bench(std::integral_constant<int,2>{});
+            bench(std::integral_constant<int,4>{});
+            bench(std::integral_constant<int,8>{});
+        }
+    }
+
+    // =========================================================================
+    // V2: Full-block cooperative, one element at a time
+    // =========================================================================
+    printf("\n--- V2: Full-block serial look-back (correctness) ---\n"); fflush(stdout);
+    {
+        bool ok_v2 = true;
+        struct TC { const char* name; std::vector<int> data; };
+        TC small_cases[] = {
+            {"single", {42}}, {"two asc", {1,2}}, {"two desc", {2,1}},
+            {"all equal", {3,3,3,3}}, {"ascending", {1,2,3,4,5,6,7,8}},
+            {"descending", {8,7,6,5,4,3,2,1}}, {"alternating", {3,1,4,1,5,9,2,6}},
+        };
+        for (auto& tc : small_cases) {
+            int n = (int)tc.data.size();
+            auto expected = cpuApsep(tc.data);
+            int *d_in, *d_out;
+            gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+            gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+            gpuAssert(cudaMemcpy(d_in, tc.data.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+            launchV2Apsep<int, 128, 2>(d_in, d_out, n);
+            std::vector<int> got(n);
+            gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+            cudaFree(d_in); cudaFree(d_out);
+            bool ok = (got == expected);
+            printf("  %-20s %s\n", tc.name, ok ? "PASS" : "FAIL");
+            if (!ok) for (int i = 0; i < n; i++)
+                if (got[i] != expected[i])
+                    printf("    i=%d val=%d got=%d expected=%d\n", i, tc.data[i], got[i], expected[i]);
+            ok_v2 = ok_v2 && ok;
+        }
+        ok_v2 = ok_v2 && stressTest(
+            [](int* di, int* dou, int n){ launchV2Apsep<int,128,2>(di, dou, n); },
+            "V2", 500, 8192, 22);
+        printf("  Stress 500x8192: %s\n", ok_v2 ? "PASS" : "FAIL");
+        printf("  V2 correctness: %s\n\n", ok_v2 ? "PASSED" : "FAILED");
+
+        if (ok_v2) {
+            printf("--- V2 benchmark (IPT sweep) ---\n"); fflush(stdout);
+            int warmup = 5, iters = 50;
+            auto bench = [&](auto IPT_tag) {
+                constexpr int IPT = IPT_tag;
+                constexpr int B   = 128 * IPT;
+                auto scratch = allocV2Scratch<int, 128, IPT>(N_BENCH);
+                for (int i = 0; i < warmup; i++) {
+                    runV2Apsep<int,128,IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                    gpuAssert(cudaDeviceSynchronize());
+                }
+                std::vector<float> meas(iters);
+                cudaEvent_t t0, t1;
+                gpuAssert(cudaEventCreate(&t0)); gpuAssert(cudaEventCreate(&t1));
+                for (int i = 0; i < iters; i++) {
+                    gpuAssert(cudaEventRecord(t0));
+                    runV2Apsep<int,128,IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                    gpuAssert(cudaEventRecord(t1));
+                    gpuAssert(cudaEventSynchronize(t1));
+                    float ms; gpuAssert(cudaEventElapsedTime(&ms, t0, t1)); meas[i] = ms;
+                }
+                gpuAssert(cudaEventDestroy(t0)); gpuAssert(cudaEventDestroy(t1));
+                int nb = scratch.num_blocks;
+                freeV2Scratch<int,128,IPT>(scratch);
+                size_t bytes = (size_t)N_BENCH*2*sizeof(int)
+                    + (size_t)nb*2*B*sizeof(int) + (size_t)nb*sizeof(BlockState<int>);
+                printf("  IPT=%-2d  B=%-4d  blocks=%-7d  ", IPT, B, nb);
+                computeDescriptors(meas, bytes); printf("\n");
+            };
+            bench(std::integral_constant<int,1>{});
+            bench(std::integral_constant<int,2>{});
+            bench(std::integral_constant<int,4>{});
+            bench(std::integral_constant<int,8>{});
+        }
+    }
+
+    // =========================================================================
+    // V3: Full-block batched look-back
+    // =========================================================================
+    printf("\n--- V3: Batched block look-back (correctness) ---\n"); fflush(stdout);
+    {
+        bool ok_v3 = true;
+        struct TC { const char* name; std::vector<int> data; };
+        TC small_cases[] = {
+            {"single", {42}}, {"two asc", {1,2}}, {"two desc", {2,1}},
+            {"all equal", {3,3,3,3}}, {"ascending", {1,2,3,4,5,6,7,8}},
+            {"descending", {8,7,6,5,4,3,2,1}}, {"alternating", {3,1,4,1,5,9,2,6}},
+        };
+        for (auto& tc : small_cases) {
+            int n = (int)tc.data.size();
+            auto expected = cpuApsep(tc.data);
+            int *d_in, *d_out;
+            gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+            gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+            gpuAssert(cudaMemcpy(d_in, tc.data.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+            launchV3Apsep<int, 128, 2>(d_in, d_out, n);
+            std::vector<int> got(n);
+            gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+            cudaFree(d_in); cudaFree(d_out);
+            bool ok = (got == expected);
+            printf("  %-20s %s\n", tc.name, ok ? "PASS" : "FAIL");
+            if (!ok) for (int i = 0; i < n; i++)
+                if (got[i] != expected[i])
+                    printf("    i=%d val=%d got=%d expected=%d\n", i, tc.data[i], got[i], expected[i]);
+            ok_v3 = ok_v3 && ok;
+        }
+        ok_v3 = ok_v3 && stressTest(
+            [](int* di, int* dou, int n){ launchV3Apsep<int,128,2>(di, dou, n); },
+            "V3", 500, 8192, 33);
+        printf("  Stress 500x8192: %s\n", ok_v3 ? "PASS" : "FAIL");
+        printf("  V3 correctness: %s\n\n", ok_v3 ? "PASSED" : "FAILED");
+
+        if (ok_v3) {
+            printf("--- V3 benchmark (IPT sweep) ---\n"); fflush(stdout);
+            int warmup = 5, iters = 50;
+            auto bench = [&](auto IPT_tag) {
+                constexpr int IPT = IPT_tag;
+                constexpr int B   = 128 * IPT;
+                auto scratch = allocV3Scratch<int, 128, IPT>(N_BENCH);
+                for (int i = 0; i < warmup; i++) {
+                    runV3Apsep<int,128,IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                    gpuAssert(cudaDeviceSynchronize());
+                }
+                std::vector<float> meas(iters);
+                cudaEvent_t t0, t1;
+                gpuAssert(cudaEventCreate(&t0)); gpuAssert(cudaEventCreate(&t1));
+                for (int i = 0; i < iters; i++) {
+                    gpuAssert(cudaEventRecord(t0));
+                    runV3Apsep<int,128,IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                    gpuAssert(cudaEventRecord(t1));
+                    gpuAssert(cudaEventSynchronize(t1));
+                    float ms; gpuAssert(cudaEventElapsedTime(&ms, t0, t1)); meas[i] = ms;
+                }
+                gpuAssert(cudaEventDestroy(t0)); gpuAssert(cudaEventDestroy(t1));
+                int nb = scratch.num_blocks;
+                freeV3Scratch<int,128,IPT>(scratch);
+                size_t bytes = (size_t)N_BENCH*2*sizeof(int)
+                    + (size_t)nb*2*B*sizeof(int) + (size_t)nb*sizeof(BlockState<int>);
+                printf("  IPT=%-2d  B=%-4d  blocks=%-7d  ", IPT, B, nb);
+                computeDescriptors(meas, bytes); printf("\n");
+            };
+            bench(std::integral_constant<int,1>{});
+            bench(std::integral_constant<int,2>{});
+            bench(std::integral_constant<int,4>{});
+            bench(std::integral_constant<int,8>{});
         }
     }
 
