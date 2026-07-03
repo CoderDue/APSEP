@@ -572,6 +572,27 @@ int main() {
         printf("  Approach 1 (two-pass):            %s\n", ok?"PASS":"FAIL");
     });
 
+    timedSection("leaves-only stress (200 trials)", [&]{
+        bool ok = stressTest("leaves-only", [](const int* di, int* dout, int n){
+            launchLeavesOnly<int,128,2,8>(di, dout, n);
+        }, 200, 8192, 4);
+        printf("  LeavesOnly (K=8):                  %s\n", ok?"PASS":"FAIL");
+    });
+
+    timedSection("warp-scan-leaves stress (200 trials)", [&]{
+        bool ok = stressTest("warp-scan-leaves", [](const int* di, int* dout, int n){
+            launchWarpScanLeaves<int,128,2,8>(di, dout, n);
+        }, 200, 8192, 5);
+        printf("  WarpScanLeaves (K=8):              %s\n", ok?"PASS":"FAIL");
+    });
+
+    timedSection("no-block-tree stress (200 trials)", [&]{
+        bool ok = stressTest("no-block-tree", [](const int* di, int* dout, int n){
+            launchNoBlockTree<int,128,2,8>(di, dout, n);
+        }, 200, 8192, 6);
+        printf("  NoBlockTree (K=8):                 %s\n", ok?"PASS":"FAIL");
+    });
+
     timedSection("scan3 spot-check (8 sizes)", [&]{
         bool ok = true;
         std::mt19937 rng(42);
@@ -643,6 +664,24 @@ int main() {
         BENCH("Approach 2: segmented scan",
               ([&]{ runScan3(d_in, d_out, N, s); }), bytes_rw, 2, 5);
         freeScan3(s);
+    });
+    timedSection("leaves-only bench (random)", [&]{
+        auto s = allocLeavesOnlyScratch<int,128,2,8>(N);
+        BENCH("LeavesOnly: apsepKernelLeavesOnly K=8",
+              ([&]{ runLeavesOnly<int,128,2,8>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeLeavesOnlyScratch<int,128,2,8>(s);
+    });
+    timedSection("warp-scan-leaves bench (random)", [&]{
+        auto s = allocWarpScanLeavesScratch<int,128,2,8>(N);
+        BENCH("WarpScanLeaves: K=8",
+              ([&]{ runWarpScanLeaves<int,128,2,8>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeWarpScanLeavesScratch<int,128,2,8>(s);
+    });
+    timedSection("no-block-tree bench (random)", [&]{
+        auto s = allocNoBlockTreeScratch<int,128,2,8>(N);
+        BENCH("NoBlockTree: apsepKernelNoBlockTree K=8",
+              ([&]{ runNoBlockTree<int,128,2,8>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeNoBlockTreeScratch<int,128,2,8>(s);
     });
 
 

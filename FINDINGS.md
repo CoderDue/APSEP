@@ -146,6 +146,45 @@ with `val < right_min` and append in forward (largest→smallest val) order.
 
 ---
 
+### 5. WarpScanLeaves kernel (winner)
+
+Combines two improvements over the baseline min-tree kernel:
+
+1. **Warp-scan intra-block PSE**: replaces the `buildMinTree` + `treePrevSmaller`
+   shared-memory tree with 5 `__shfl_up_sync` prefix-min steps.  Eliminates the
+   `s_tree[2*B]` shared-memory region entirely.
+
+2. **Leaves-only global publish**: writes only the `B` raw input elements to
+   `d_block_leaves` instead of the full `2*B` min-tree.  The last-in-SB block
+   reads these leaves to build the merged SB tree.  Intra-SB look-back does a
+   linear scan over stored leaves.
+
+**Effect on shared memory:** `3076 → 1060 bytes/block` (~3× reduction), enabling
+more concurrent blocks per SM and significantly improving occupancy.
+
+**K sweep results (BS=128, IPT=2, N=32M ints):**
+
+| K | WarpScanLeaves GB/s | Baseline GB/s |
+|---|---|---|
+| 1 | 17.0 | 13.5 |
+| 2 | 24.9 | 18.9 |
+| 4 | 33.5 | 23.8 |
+| 8 | 40.7 | 27.2 |
+| **16** | **43.6** | **27.1** |
+| 32 | 39.6 | 26.6 |
+
+**Best configuration: WarpScanLeaves K=16 → 43.6 GB/s** (15.1% of peak).
+
+Cross-check with 500 MiB benchmark (bench_approaches, K=8): **26.8 GB/s** vs
+baseline 17.9 GB/s — consistent ~1.5× speedup at K=8 and even larger at K=16.
+
+The key insight: the shared memory bottleneck (not global memory traffic) was
+limiting occupancy.  Removing `s_tree[2*B]` allowed ~3× more blocks per SM,
+which better hides the serial look-back latency and keeps the memory subsystem
+busier.
+
+---
+
 ## Summary table
 
 | Kernel | GB/s | Serial steps | Notes |
@@ -155,10 +194,14 @@ with `val < right_min` and append in forward (largest→smallest val) order.
 | Stack look-back K=1 | 8.0 | 512K | Compact stack; worse than tree |
 | Two-pass suffix-stack | 5.8 | — | O(N) pass-2 scan per element |
 | Segmented scan (CUB) | 9.2 | — | Two passes; MergeOp overhead |
-| Min-tree K=8 (**best**) | **17.4** | 64K | After intra-SB bug fix |
+| Min-tree K=8 (baseline) | 17.4 | 64K | After intra-SB bug fix |
+| LeavesOnly K=8 | 16.7 | 64K | Saves N write bytes; no SM gain |
+| NoBlockTree K=8 | 16.7 | 64K | Same as LeavesOnly |
+| WarpScanLeaves K=8 | 26.8 | 64K | Shared memory cut 3×; 1.5× faster |
+| **WarpScanLeaves K=16** | **43.6** | 32K | **Best: occupancy + fewer steps** |
 | Persistent-thread | ~0 | 192 × chunk | Effectively serial |
 
-The 17.4 GB/s result is the practical ceiling for single-pass APSEP on this
-GPU.  Closing the remaining ~14× gap to peak bandwidth would require a
-fundamentally different algorithm (e.g., a multi-pass approach with a
-commutative/associative aggregate — which APSEP does not have).
+WarpScanLeaves K=16 at **43.6 GB/s** is the best single-pass result (15.1% of
+peak, ~6.7× serialization).  The remaining gap to peak is inherent to the
+serial dependency chain in APSEP — no single-pass algorithm can close it without
+a fundamentally different aggregate structure.

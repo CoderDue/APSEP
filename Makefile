@@ -8,13 +8,15 @@ TARGET           := apsep_test
 BENCH_TARGET     := bench_variants
 PROFILE_TARGET   := profile_lookback
 APPROACHES_TARGET := bench_approaches
+SWEEP_TARGET     := bench_sweep
 SRC              := src/main.cu
 BENCH_SRC        := src/bench_variants.cu
 PROFILE_SRC      := src/profile_lookback.cu
 APPROACHES_SRC   := src/bench_approaches.cu
+SWEEP_SRC        := src/bench_sweep.cu
 INCLUDES         := -Isrc
 
-.PHONY: all bench profile approaches clean
+.PHONY: all bench profile approaches bench_sweep clean
 
 all: $(TARGET)
 
@@ -36,5 +38,8 @@ $(PROFILE_TARGET): $(PROFILE_SRC) src/apsep.cuh
 $(APPROACHES_TARGET): $(APPROACHES_SRC) src/apsep.cuh
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(APPROACHES_SRC)
 
+$(SWEEP_TARGET): $(SWEEP_SRC) src/apsep.cuh
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SWEEP_SRC)
+
 clean:
-	rm -f $(TARGET) $(BENCH_TARGET) $(PROFILE_TARGET) $(APPROACHES_TARGET)
+	rm -f $(TARGET) $(BENCH_TARGET) $(PROFILE_TARGET) $(APPROACHES_TARGET) $(SWEEP_TARGET)
