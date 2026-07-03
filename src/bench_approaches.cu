@@ -695,9 +695,15 @@ int main() {
               ([&]{ runNoBlockTree<int,128,2,8>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
         freeNoBlockTreeScratch<int,128,2,8>(s);
     });
+    timedSection("wsnt-ipt4-k64 bench (random)", [&]{
+        auto s = allocWarpScanNoTreeScratch<int,128,4,64>(N);
+        BENCH("WarpScanNoTree: IPT=4 K=64",
+              ([&]{ runWarpScanNoTree<int,128,4,64>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeWarpScanNoTreeScratch<int,128,4,64>(s);
+    });
     timedSection("wsnt-ipt4-k128 bench (random)", [&]{
         auto s = allocWarpScanNoTreeScratch<int,128,4,128>(N);
-        BENCH("WarpScanNoTree: IPT=4 K=128 (new best?)",
+        BENCH("WarpScanNoTree: IPT=4 K=128",
               ([&]{ runWarpScanNoTree<int,128,4,128>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
         freeWarpScanNoTreeScratch<int,128,4,128>(s);
     });

@@ -133,6 +133,12 @@ int main() {
                "WarpScanNoTree IPT=4 K=128", dc_in, dc_out, NC);
     quickCheck([](int* di, int* dou, int n){ launchWarpScanNoTree<int,128,4,256>(di,dou,n); },
                "WarpScanNoTree IPT=4 K=256", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpScanNoTree<int,128,8,8>(di,dou,n); },
+               "WarpScanNoTree IPT=8 K=8", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpScanNoTree<int,128,8,64>(di,dou,n); },
+               "WarpScanNoTree IPT=8 K=64", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpScanNoTree<int,256,2,64>(di,dou,n); },
+               "WarpScanNoTree BS=256 IPT=2 K=64", dc_in, dc_out, NC);
     cudaFree(dc_in); cudaFree(dc_out);
 
     printf("\n=== WarpScanLeaves K sweep at BS=128 IPT=4 ===\n");
@@ -145,14 +151,41 @@ int main() {
 
     printf("\n=== WarpScanNoTree K sweep at BS=128 IPT=4 ===\n");
     benchWSNT<128, 4,  8>(d_in, d_out, N, bytes_rw);
-    benchWSNT<128, 4, 16>(d_in, d_out, N, bytes_rw);
     benchWSNT<128, 4, 32>(d_in, d_out, N, bytes_rw);
     benchWSNT<128, 4, 64>(d_in, d_out, N, bytes_rw);
     benchWSNT<128, 4,128>(d_in, d_out, N, bytes_rw);
     benchWSNT<128, 4,256>(d_in, d_out, N, bytes_rw);
 
-    printf("\n=== Reference: WSL IPT=2 K=16 ===\n");
+    printf("\n=== WarpScanNoTree IPT=8 K sweep (B=1024, fewer serial steps) ===\n");
+    benchWSNT<128, 8,  8>(d_in, d_out, N, bytes_rw);
+    benchWSNT<128, 8, 32>(d_in, d_out, N, bytes_rw);
+    benchWSNT<128, 8, 64>(d_in, d_out, N, bytes_rw);
+    benchWSNT<128, 8,128>(d_in, d_out, N, bytes_rw);
+
+    printf("\n=== WarpScanNoTree IPT=2 K sweep (B=256, reference) ===\n");
+    benchWSNT<128, 2,  8>(d_in, d_out, N, bytes_rw);
+    benchWSNT<128, 2, 64>(d_in, d_out, N, bytes_rw);
+    benchWSNT<128, 2,128>(d_in, d_out, N, bytes_rw);
+
+    printf("\n=== WarpScanNoTree BS=256 IPT=2 (B=512, same tile, more threads) ===\n");
+    benchWSNT<256, 2, 32>(d_in, d_out, N, bytes_rw);
+    benchWSNT<256, 2, 64>(d_in, d_out, N, bytes_rw);
+    benchWSNT<256, 2,128>(d_in, d_out, N, bytes_rw);
+
+    printf("\n=== Fine comparison: WSNT IPT=4 K=64 vs K=128 (10 iters each) ===\n");
+    {
+        auto s64  = allocWarpScanNoTreeScratch<int,128,4, 64>(N);
+        auto s128 = allocWarpScanNoTreeScratch<int,128,4,128>(N);
+        BENCH("WarpScanNoTree IPT=4 K=64",
+              ([&]{ runWarpScanNoTree<int,128,4, 64>(d_in, d_out, N, s64);  }), bytes_rw, 3, 10);
+        BENCH("WarpScanNoTree IPT=4 K=128",
+              ([&]{ runWarpScanNoTree<int,128,4,128>(d_in, d_out, N, s128); }), bytes_rw, 3, 10);
+        freeWarpScanNoTreeScratch<int,128,4, 64>(s64);
+        freeWarpScanNoTreeScratch<int,128,4,128>(s128);
+    }
+    printf("\n=== Reference: WSL IPT=2 K=16 and WSNT IPT=4 K=128 ===\n");
     benchWSL<128, 2, 16>(d_in, d_out, N, bytes_rw);
+    benchWSNT<128, 4,128>(d_in, d_out, N, bytes_rw);
 
     cudaFree(d_in);
     cudaFree(d_out);

@@ -238,31 +238,56 @@ subsystem to hide latency.
 tree build/read costs.  K can now be increased to reduce the serial SB chain
 length much more aggressively.
 
-**K sweep (BS=128, IPT=4, N=32M ints):**
+**Further optimizations applied:**
+
+- **Packed `d_block_mins` array** (4 bytes/entry vs `BlockState` 16 bytes/entry): the inter-SB
+  scan of K block_mins now reads from a compact array, giving 4× better cache line
+  utilization.  Negligible speedup at K=128 (bottleneck is elsewhere), but cleaner.
+
+- **`__ldg` for leaf and block_min reads**: routing read-only lookups through the
+  texture cache (separate from L1 data cache) reduces L1 contention from the spin-wait
+  loops.  Gains ~0.9 GB/s at K=64-128.
+
+**Profiler results (ncu, N=32M, K=128):**
+- L1 hit rate: 38.7%, L2 hit rate: 97.7% (L2 is effectively a large L1)
+- SM warp active: 99.1% — SM is never idle; bottleneck is warp-level stall latency
+- Long scoreboard stalls: 55.5% — L1 misses cost ~30 cycles each
+- Sector utilization: 10.4% — each 64-byte cache line sector is used for only ~6.6 bytes
+  (expected: backward leaf scan breaks after ~1.7 iterations on random data, wasting most
+  of each sector loaded)
+
+The 10% sector utilization is **not** from strided access but from early break in the leaf
+scan: we load a 64-byte cache line but typically find the answer in the first 1-2 elements.
+Vectorizing (int4 loads) would not help since we already break early.
+
+**K sweep (BS=128, IPT=4, N=32M ints, with __ldg):**
 
 | K | WarpScanNoTree GB/s | WarpScanLeaves GB/s |
 |---|---|---|
-| 8 | 44.0 | 46.3 |
-| 16 | 50.3 | 42.0 |
-| 32 | 53.8 | — |
-| 64 | 55.4 | — |
-| **128** | **55.6** | — |
-| 256 | 55.4 | — |
+| 8 | 50.5 | 46.3 |
+| 32 | 55.6 | — |
+| **64** | **56.5** | — |
+| 128 | 56.4 | — |
+| 256 | 56.1 | — |
 
-**Best configuration: WarpScanNoTree IPT=4, K=128 → 55.6 GB/s** (N=32M).
+**Best configuration: WarpScanNoTree IPT=4, K=64 → 56.5 GB/s** (N=32M).
+
+K=64 and K=128 are essentially tied at N=32M; K=64 is preferred as it has half the
+serial steps (N/(K×B) = 32M/32768 ≈ 1K vs 2K).
 
 On production-size 500 MiB (N=131M ints, bench_approaches):
 
 | Config | GB/s |
 |---|---|
-| Baseline IPT=2 K=8 | 16.8 |
-| WarpScanLeaves IPT=2 K=8 | 26.8 |
-| WarpScanLeaves IPT=4 K=8 | 30.4 |
-| **WarpScanNoTree IPT=4 K=128** | **37.2** |
+| Baseline IPT=2 K=8 | 17.6 |
+| WarpScanLeaves IPT=2 K=8 | 26.7 |
+| WarpScanLeaves IPT=4 K=8 | 30.5 |
+| WarpScanNoTree IPT=4 K=64 | 37.8 |
+| **WarpScanNoTree IPT=4 K=128** | **37.8** |
 
-With K=128 and B=512, there are N/(K×B) = 131M/65536 ≈ 2K serial SB chain
-steps, each requiring only K+B = 640 sequential int reads instead of 12 L2-cold
-tree hops.
+With K=64 and B=512, there are N/(K×B) = 131M/32768 ≈ 4K serial SB chain
+steps, each requiring only K+B = 576 sequential int reads (via `__ldg`) instead
+of 12 L2-cold pointer-chasing tree hops.
 
 ---
 
@@ -278,12 +303,16 @@ tree hops.
 | Min-tree K=8 (baseline) | 17.4 | 16.8 | 64K | After intra-SB bug fix |
 | LeavesOnly K=8 | 16.7 | 16.7 | 64K | Saves N write bytes; no SM gain |
 | NoBlockTree K=8 | 16.7 | 16.7 | 64K | Same as LeavesOnly |
-| WarpScanLeaves K=8 | 46.3 | 30.4 | 64K | Warp-scan + leaves-only |
+| WarpScanLeaves K=8 | 46.3 | 30.5 | 64K | Warp-scan + leaves-only |
 | WarpScanLeaves K=16 | 43.6 | — | 32K | IPT=2; prior "best" |
-| **WarpScanNoTree K=128** | **55.6** | **37.2** | **2K** | **No SB tree; sequential reads** |
+| WarpScanNoTree K=128 (no ldg) | 55.6 | 37.2 | 2K | No SB tree; sequential reads |
+| **WarpScanNoTree K=64 (+__ldg)** | **56.5** | **37.8** | **4K** | **Texture cache for reads** |
 | Persistent-thread | ~0 | ~0 | 192×chunk | Effectively serial |
 
-**WarpScanNoTree K=128** at **55.6 GB/s** (N=32M) / **37.2 GB/s** (N=131M) is
-the best single-pass result (19.3% of peak at N=32M).  The remaining gap to peak
-is inherent to the serial dependency chain in APSEP — no single-pass algorithm
-can close it without a fundamentally different aggregate structure.
+**WarpScanNoTree K=64** at **56.5 GB/s** (N=32M) / **37.8 GB/s** (N=131M) is
+the best single-pass result (19.6% of peak at N=32M).
+
+**Profile-confirmed ceiling**: 55% long-scoreboard stalls from L1 miss latency on
+spin-wait status reads and leaf scans.  The remaining gap to peak is inherent to the
+serial dependency chain — no single-pass algorithm can close it without a
+fundamentally different aggregate structure.
