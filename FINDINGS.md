@@ -21,7 +21,7 @@ global memory.  Elements without an intra-block answer perform a **decoupled
 look-back** at super-block granularity: they spin-wait on status flags of
 previous super-blocks of `K` blocks each, then query the merged tree.
 
-**Best result: IPT=2, K=8 → 15.6 GB/s** (5.4% of peak, ~16× serialization).
+**Best result: IPT=2, K=8 → 17.4 GB/s** (6.0% of peak, ~14× serialization; after bug fix — see below).
 
 The K sweep showed a clear optimum around K=8.  Smaller K means more serial
 look-back steps; larger K means more work per super-block before publishing,
@@ -37,9 +37,9 @@ stripe.  Results go directly into registers, written once at the end.
 **Intra-block throughput: ~107 GB/s** (IPT=2, B=256).  This is 44% of peak —
 a solid result for the intra-block phase.
 
-End-to-end (with the original tree look-back at K=8): **15.6 GB/s**, same as
-before.  The intra-block phase is fast; the bottleneck is the inter-block
-serial chain.
+End-to-end (with the original tree look-back at K=8): **17.4 GB/s** (after bug
+fix).  The intra-block phase is fast; the bottleneck is the inter-block serial
+chain.
 
 ### 3. Stack look-back kernel
 
@@ -94,6 +94,58 @@ that is often cached.
 
 ---
 
+## Bug fix: intra-superblock look-back
+
+Elements needing an answer from an earlier block *within the same superblock*
+(`sb_local > 0`, answer not in own block) previously had no path to find it:
+the intra-block PSE only covers the element's own block, and `decoupledLookback`
+only scanned *previous* superblocks.  These elements incorrectly returned -1.
+
+**Fix:** before calling `decoupledLookback`, scan per-block trees for blocks
+`sb_first .. block_id-1` in the same superblock (spin-waiting on each block's
+status flag as needed).  This is the same wait that the last-in-SB block already
+performs, just scoped to the querying block's own earlier siblings.
+
+**Effect:** throughput improved from ~15.7 GB/s to ~17.4 GB/s because affected
+elements no longer spin fruitlessly waiting on a superblock tree that will never
+contain their answer.
+
+---
+
+## Alternative full-array approaches (benchmarked 2026-07-03)
+
+Three alternative algorithms were benchmarked against the corrected single-pass
+kernel on 500 MiB of uniform random `int` data (GTX 1660 Ti):
+
+### Two-pass: intra-block + inter-block suffix-stack lookback
+
+Pass 1 uses the warp-scan intra-block kernel (B=128) and builds a monotone
+suffix stack per block.  Pass 2 launches one thread per element still at -1,
+scanning backward over published stacks.
+
+**Result: ~5.8 GB/s.**  Pass 2 has O(N) work per element in the worst case,
+and even on random data the backward scan over all prior stacks is slow.
+
+### Segmented scan: CUB DeviceScan with monotone-stack MergeOp
+
+Pass A computes intra-block PSE and builds a per-block carry (monotone suffix
+stack).  CUB `DeviceScan::ExclusiveScan` with a custom `MergeOp` accumulates
+the prefix carry for each block.  Pass B uses the prefix carry to answer any
+element still at -1 via binary search.
+
+**Result: ~9.2 GB/s.**  Faster than two-pass but still ~2× slower than the
+single-pass kernel.  CUB's device scan over 516-byte `BlockCarry3` structs has
+high per-call overhead, and the `MergeOp` itself (copying + filtering the left
+carry) is expensive.
+
+**Bug found and fixed in MergeOp:** the original implementation iterated left
+carry entries from `depth-1` to `0` (smallest→largest val) when appending,
+breaking the monotone-decreasing invariant.  The binary search then returned
+the wrong (leftmost) index.  Fix: find the contiguous suffix of left entries
+with `val < right_min` and append in forward (largest→smallest val) order.
+
+---
+
 ## Summary table
 
 | Kernel | GB/s | Serial steps | Notes |
@@ -101,11 +153,12 @@ that is often cached.
 | Warp-scan (intra-block only) | 107 | — | No inter-block answer |
 | Min-tree K=1 | 8.7 | 512K | Baseline end-to-end |
 | Stack look-back K=1 | 8.0 | 512K | Compact stack; worse than tree |
-| Min-tree K=8 (**best**) | **15.6** | 64K | Optimal K empirically |
+| Two-pass suffix-stack | 5.8 | — | O(N) pass-2 scan per element |
+| Segmented scan (CUB) | 9.2 | — | Two passes; MergeOp overhead |
+| Min-tree K=8 (**best**) | **17.4** | 64K | After intra-SB bug fix |
 | Persistent-thread | ~0 | 192 × chunk | Effectively serial |
 
-The 15.6 GB/s result is approximately the practical ceiling for single-pass
-APSEP on this GPU.  Closing the remaining ~6× gap to memory bandwidth would
-require a fundamentally different algorithm (e.g., multi-pass with a
-work-efficient prefix-scan over a commutative/associative aggregate — which
-APSEP does not have).
+The 17.4 GB/s result is the practical ceiling for single-pass APSEP on this
+GPU.  Closing the remaining ~14× gap to peak bandwidth would require a
+fundamentally different algorithm (e.g., a multi-pass approach with a
+commutative/associative aggregate — which APSEP does not have).
