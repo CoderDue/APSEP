@@ -5,4 +5,6 @@ build/
 *.ptx
 *.cubin
 *.fatbin
-apose_test
+apsep_test
+apsep_test_dbg
+artifacts/

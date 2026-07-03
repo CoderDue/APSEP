@@ -1,9 +1,9 @@
-// Test and benchmark program for the single-pass APOSE kernel.
+// Test and benchmark program for the single-pass APSEP kernel.
 //
 // Compiles a CPU reference implementation of the PSE problem and compares it
 // against the GPU kernel for varying input sizes.  Also reports throughput.
 
-#include "apose.cuh"
+#include "apsep.cuh"
 
 #include <vector>
 #include <random>
@@ -20,7 +20,7 @@
 // Returns a vector of indices (or -1).
 // ---------------------------------------------------------------------------
 
-static std::vector<int> cpuApose(const std::vector<int>& arr) {
+static std::vector<int> cpuApsep(const std::vector<int>& arr) {
     int n = (int)arr.size();
     std::vector<int> result(n, -1);
     std::vector<int> stk;
@@ -55,7 +55,7 @@ static bool testCase(const std::vector<int>& h_in, bool verbose = false) {
     int n = (int)h_in.size();
 
     // CPU reference
-    auto h_expected = cpuApose(h_in);
+    auto h_expected = cpuApsep(h_in);
 
     // GPU
     int *d_in = nullptr, *d_out = nullptr;
@@ -63,7 +63,7 @@ static bool testCase(const std::vector<int>& h_in, bool verbose = false) {
     gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
     gpuAssert(cudaMemcpy(d_in, h_in.data(), n * sizeof(int), cudaMemcpyHostToDevice));
 
-    launchApose<int>(d_in, d_out, n);
+    launchApsep<int>(d_in, d_out, n);
 
     std::vector<int> h_out(n);
     gpuAssert(cudaMemcpy(h_out.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
@@ -102,29 +102,28 @@ static bool runSmallTests() {
     struct TC { const char* name; std::vector<int> data; };
 
     TC cases[] = {
-        {"single element",            {42}},
-        {"two ascending",             {1, 2}},
-        {"two descending",            {2, 1}},
-        {"all equal",                 {5, 5, 5, 5, 5}},
-        {"ascending sequence",        {1, 2, 3, 4, 5, 6, 7, 8}},
-        {"descending sequence",       {8, 7, 6, 5, 4, 3, 2, 1}},
-        {"alternating",               {3, 1, 4, 1, 5, 9, 2, 6}},
-        {"exact block size (B=512)",  {} /* filled below */},
-        {"two full blocks",           {} /* filled below */},
-        {"non-power-of-two length",   {} /* filled below */},
+        {"single element",           {42}},
+        {"two ascending",            {1, 2}},
+        {"two descending",           {2, 1}},
+        {"all equal",                {5, 5, 5, 5, 5}},
+        {"ascending sequence",       {1, 2, 3, 4, 5, 6, 7, 8}},
+        {"descending sequence",      {8, 7, 6, 5, 4, 3, 2, 1}},
+        {"alternating",              {3, 1, 4, 1, 5, 9, 2, 6}},
+        {"exact block size (B=512)", {} /* filled below */},
+        {"two full blocks",          {} /* filled below */},
+        {"non-power-of-two length",  {} /* filled below */},
     };
 
-    // Fill dynamic cases
     // B = 128 * 4 = 512
     constexpr int B = 128 * 4;
 
     auto& tc_exact = cases[7].data;
     tc_exact.resize(B);
-    std::iota(tc_exact.begin(), tc_exact.end(), 0); // 0,1,2,...,B-1
+    std::iota(tc_exact.begin(), tc_exact.end(), 0);
 
     auto& tc_two = cases[8].data;
     tc_two.resize(2 * B);
-    for (int i = 0; i < 2 * B; i++) tc_two[i] = (i % 7) * 13; // pseudo-random
+    for (int i = 0; i < 2 * B; i++) tc_two[i] = (i % 7) * 13;
 
     auto& tc_odd = cases[9].data;
     tc_odd.resize(B + 13);
@@ -162,18 +161,190 @@ static bool runStressTest(int num_trials, int max_n, unsigned seed) {
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: measure GB/s for a large random array
+// Benchmark statistics
 // ---------------------------------------------------------------------------
 
-static void benchmark(int n, int warmup = 3, int iters = 10) {
-    constexpr int BLOCK_SIZE = 128;
-    constexpr int IPT        = 4;
-    constexpr int B          = BLOCK_SIZE * IPT;
+static void computeDescriptors(const std::vector<float>& measurements,
+                                size_t bytes) {
+    size_t size = measurements.size();
+    double sample_mean     = 0;
+    double sample_variance = 0;
+    double sample_gbps     = 0;
+    double factor = (double)bytes / (1000.0 * (double)size);
 
-    std::vector<int> h_in(n);
-    std::mt19937 rng(0xBEEF);
-    std::uniform_int_distribution<int> dist(0, n);
-    for (auto& v : h_in) v = dist(rng);
+    for (size_t i = 0; i < size; i++) {
+        double diff = std::max(1e3 * (double)measurements[i], 0.5);
+        sample_mean     += diff / (double)size;
+        sample_variance += (diff * diff) / (double)size;
+        sample_gbps     += factor / diff;
+    }
+    double sample_std = std::sqrt(sample_variance);
+    double bound = (0.95 * sample_std) / std::sqrt((double)size);
+
+    printf("%.0fμs (95%% CI: [%.1fμs, %.1fμs]); %.1f GB/s",
+           sample_mean, sample_mean - bound, sample_mean + bound, sample_gbps);
+}
+
+// ---------------------------------------------------------------------------
+// Baseline: plain device-to-device memcpy (measures achievable bandwidth)
+// ---------------------------------------------------------------------------
+
+__global__ void copyKernel(const int* __restrict__ src, int* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
+static double baselineBandwidth(int n, int warmup = 5, int iters = 50) {
+    int *d_in = nullptr, *d_out = nullptr;
+    gpuAssert(cudaMalloc(&d_in,  (size_t)n * sizeof(int)));
+    gpuAssert(cudaMalloc(&d_out, (size_t)n * sizeof(int)));
+    gpuAssert(cudaMemset(d_in, 0, (size_t)n * sizeof(int)));
+
+    constexpr int BS = 256;
+    int grid = (n + BS - 1) / BS;
+
+    for (int i = 0; i < warmup; i++)
+        copyKernel<<<grid, BS>>>(d_in, d_out, n);
+
+    cudaEvent_t tstart, tstop;
+    cudaEventCreate(&tstart);
+    cudaEventCreate(&tstop);
+
+    std::vector<float> measurements(iters);
+    for (int i = 0; i < iters; i++) {
+        cudaEventRecord(tstart);
+        copyKernel<<<grid, BS>>>(d_in, d_out, n);
+        cudaEventRecord(tstop);
+        cudaEventSynchronize(tstop);
+        cudaEventElapsedTime(&measurements[i], tstart, tstop);
+    }
+
+    cudaEventDestroy(tstart);
+    cudaEventDestroy(tstop);
+    cudaFree(d_in);
+    cudaFree(d_out);
+
+    size_t bytes = (size_t)n * 2 * sizeof(int);
+    double mean_ms = 0;
+    for (float m : measurements) mean_ms += m / iters;
+    return (double)bytes / 1e9 / (mean_ms * 1e-3);
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: one (IPT, K) configuration. Returns mean GB/s.
+// ---------------------------------------------------------------------------
+
+template <int IPT, int K>
+static double benchmarkConfig(const int* d_in, int* d_out, int n,
+                              double peak_gbps, double baseline_gbps,
+                              int warmup = 5, int iters = 50) {
+    constexpr int BLOCK_SIZE  = 128;
+    constexpr int B           = BLOCK_SIZE * IPT;
+
+    auto scratch = allocApsepScratch<int, BLOCK_SIZE, IPT, K>(n);
+
+    for (int i = 0; i < warmup; i++) {
+        runApsep<int, BLOCK_SIZE, IPT, K>(d_in, d_out, n, scratch);
+        gpuAssert(cudaDeviceSynchronize());
+    }
+
+    std::vector<float> measurements(iters);
+    cudaEvent_t tstart, tstop;
+    cudaEventCreate(&tstart);
+    cudaEventCreate(&tstop);
+
+    for (int i = 0; i < iters; i++) {
+        cudaEventRecord(tstart);
+        runApsep<int, BLOCK_SIZE, IPT, K>(d_in, d_out, n, scratch);
+        cudaEventRecord(tstop);
+        cudaEventSynchronize(tstop);
+        cudaEventElapsedTime(&measurements[i], tstart, tstop);
+    }
+
+    cudaEventDestroy(tstart);
+    cudaEventDestroy(tstop);
+    freeApsepScratch<int, BLOCK_SIZE, IPT, K>(scratch);
+
+    int    num_blocks    = (n + B - 1) / B;
+    int    num_sb        = (num_blocks + K - 1) / K;
+
+    size_t bs_sz  = sizeof(BlockState<int>);
+    size_t sbs_sz = sizeof(SuperBlockState<int>);
+    size_t bytes =
+        (size_t)n * 2 * sizeof(int)
+        + (size_t)num_blocks * 2 * B * sizeof(int)
+        + (size_t)num_blocks * bs_sz
+        + (size_t)num_sb * K * B * sizeof(int)
+        + (size_t)num_sb * 2 * K * B * sizeof(int)
+        + (size_t)num_sb * sbs_sz
+        + (size_t)num_sb * (K - 1) * bs_sz;
+
+    double mean_ms       = 0;
+    for (float m : measurements) mean_ms += m / iters;
+    double achieved_gbps = (double)bytes / 1e9 / (mean_ms * 1e-3);
+    double serial_factor = baseline_gbps / achieved_gbps;
+
+    printf("  IPT=%-2d  K=%-4d  B=%-4d  blocks=%-7d  superblocks=%-6d  ",
+           IPT, K, B, num_blocks, num_sb);
+    computeDescriptors(measurements, bytes);
+    printf("  (%.0f%% of peak; serialization %.1fx)\n",
+           achieved_gbps / peak_gbps * 100.0, serial_factor);
+
+    return achieved_gbps;
+}
+
+// ---------------------------------------------------------------------------
+// Sweep K and IPT using struct-based recursion
+// ---------------------------------------------------------------------------
+
+struct BestConfig { int ipt, k; double gbps; };
+
+template <int IPT, int K, bool DONE = (K >= 64)>
+struct SweepK {
+    static BestConfig run(const int* d_in, int* d_out, int n,
+                          double peak_gbps, double baseline_gbps,
+                          BestConfig best) {
+        double gbps = benchmarkConfig<IPT, K>(d_in, d_out, n, peak_gbps, baseline_gbps);
+        if (gbps > best.gbps) best = {IPT, K, gbps};
+        return SweepK<IPT, K * 2>::run(d_in, d_out, n, peak_gbps, baseline_gbps, best);
+    }
+};
+
+template <int IPT, int K>
+struct SweepK<IPT, K, true> {
+    static BestConfig run(const int*, int*, int, double, double, BestConfig best) {
+        return best;
+    }
+};
+
+template <int IPT, bool DONE = (IPT >= 32)>
+struct SweepIPT {
+    static BestConfig run(const int* d_in, int* d_out, int n,
+                          double peak_gbps, double baseline_gbps,
+                          BestConfig best) {
+        best = SweepK<IPT, 1>::run(d_in, d_out, n, peak_gbps, baseline_gbps, best);
+        return SweepIPT<IPT * 2>::run(d_in, d_out, n, peak_gbps, baseline_gbps, best);
+    }
+};
+
+template <int IPT>
+struct SweepIPT<IPT, true> {
+    static BestConfig run(const int*, int*, int, double, double, BestConfig best) {
+        printf("  --> Best: IPT=%d  K=%d  (%.1f GB/s)\n", best.ipt, best.k, best.gbps);
+        return best;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Large correctness test helper
+// ---------------------------------------------------------------------------
+
+static bool largeTest(const char* label, std::vector<int>& h_in) {
+    int n = (int)h_in.size();
+    printf("=== Large correctness test: %s (%zu MiB) ===\n",
+           label, h_in.size() * sizeof(int) / (1024 * 1024));
+
+    auto h_expected = cpuApsep(h_in);
 
     int *d_in = nullptr, *d_out = nullptr;
     gpuAssert(cudaMalloc(&d_in,  (size_t)n * sizeof(int)));
@@ -181,36 +352,28 @@ static void benchmark(int n, int warmup = 3, int iters = 10) {
     gpuAssert(cudaMemcpy(d_in, h_in.data(), (size_t)n * sizeof(int),
                          cudaMemcpyHostToDevice));
 
-    // Warm-up
-    for (int i = 0; i < warmup; i++)
-        launchApose<int, BLOCK_SIZE, IPT>(d_in, d_out, n);
+    launchApsep<int>(d_in, d_out, n);
 
-    // Timed runs
-    cudaEvent_t tstart, tstop;
-    cudaEventCreate(&tstart);
-    cudaEventCreate(&tstop);
-
-    cudaEventRecord(tstart);
-    for (int i = 0; i < iters; i++)
-        launchApose<int, BLOCK_SIZE, IPT>(d_in, d_out, n);
-    cudaEventRecord(tstop);
-    cudaEventSynchronize(tstop);
-
-    float ms = 0;
-    cudaEventElapsedTime(&ms, tstart, tstop);
-    ms /= iters;
-
-    double bytes = (double)n * (sizeof(int) + sizeof(int)); // read + write
-    double gbps  = bytes / (ms * 1e-3) / 1e9;
-
-    int num_blocks = (n + B - 1) / B;
-    printf("  n=%-10d  blocks=%-6d  %.2f ms  %.1f GB/s\n",
-           n, num_blocks, ms, gbps);
-
-    cudaEventDestroy(tstart);
-    cudaEventDestroy(tstop);
+    std::vector<int> h_out(n);
+    gpuAssert(cudaMemcpy(h_out.data(), d_out, (size_t)n * sizeof(int),
+                         cudaMemcpyDeviceToHost));
     cudaFree(d_in);
     cudaFree(d_out);
+
+    int mismatches = 0;
+    for (int i = 0; i < n; i++) {
+        if (h_out[i] != h_expected[i]) {
+            if (mismatches < 5)
+                printf("  MISMATCH at i=%d  val=%d  got=%d  expected=%d\n",
+                       i, h_in[i], h_out[i], h_expected[i]);
+            mismatches++;
+        }
+    }
+    bool ok = (mismatches == 0);
+    printf("  %s", ok ? "PASSED" : "FAILED");
+    if (!ok) printf(" (%d mismatches)", mismatches);
+    printf("\n\n");
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +390,7 @@ int main(int argc, char** argv) {
            prop.name, prop.major, prop.minor,
            prop.multiProcessorCount,
            prop.sharedMemPerMultiprocessor / 1024.0 / 1024.0);
-    printf("Kernel config: BLOCK_SIZE=128, IPT=4, B=%d\n\n", 128 * 4);
+    printf("Kernel config: BLOCK_SIZE=128\n\n");
 
     // ---- Correctness ----
     printf("=== Small structured tests ===\n");
@@ -242,10 +405,163 @@ int main(int argc, char** argv) {
     bool ok3 = runStressTest(100, 1 << 20, 137);
     printf("  %s\n\n", ok3 ? "All PASSED" : "Some FAILED");
 
+    // ---- Large correctness tests (100 MiB each) ----
+    constexpr int N_LARGE = 100 * 1024 * 1024 / sizeof(int);
+    bool ok_large = true;
+
+    {
+        std::vector<int> h(N_LARGE);
+        std::mt19937 rng(0xDEAD);
+        std::uniform_int_distribution<int> dist(0, 1000000);
+        for (auto& v : h) v = dist(rng);
+        ok_large = largeTest("uniform random [0, 1000000]", h) && ok_large;
+    }
+
+    {
+        std::vector<int> h(N_LARGE, 1);
+        h[0] = 0;
+        ok_large = largeTest("mostly-ones [0, 1, 1, 1, ...]", h) && ok_large;
+    }
+
+    {
+        std::vector<int> h(N_LARGE);
+        std::mt19937 rng(0xBEEF);
+        std::exponential_distribution<double> dist(1.0);
+        for (auto& v : h) v = (int)(dist(rng) * 1000.0);
+        ok_large = largeTest("exponential (lambda=1, scaled x1000)", h) && ok_large;
+    }
+
+    ok1 = ok1 && ok_large;
+
     // ---- Benchmark ----
-    printf("=== Benchmark ===\n");
-    for (int exp = 18; exp <= 26; exp++)
-        benchmark(1 << exp);
+    double peak_gbps = (double)prop.memoryClockRate * 1e3
+                     * (double)prop.memoryBusWidth / 8.0
+                     * 2.0
+                     / 1e9;
+    constexpr int N_BENCH = 500 * 1024 * 1024 / sizeof(int);
+    double baseline_gbps = baselineBandwidth(N_BENCH);
+    printf("=== IPT sweep benchmark (theoretical peak: %.1f GB/s, copy baseline: %.1f GB/s) ===\n",
+           peak_gbps, baseline_gbps);
+
+    std::vector<int> h_bench(N_BENCH);
+    {
+        std::mt19937 rng(0xBEEF);
+        std::uniform_int_distribution<int> dist(0, N_BENCH);
+        for (auto& v : h_bench) v = dist(rng);
+    }
+    int *d_bench_in = nullptr, *d_bench_out = nullptr;
+    gpuAssert(cudaMalloc(&d_bench_in,  (size_t)N_BENCH * sizeof(int)));
+    gpuAssert(cudaMalloc(&d_bench_out, (size_t)N_BENCH * sizeof(int)));
+    gpuAssert(cudaMemcpy(d_bench_in, h_bench.data(), (size_t)N_BENCH * sizeof(int),
+                         cudaMemcpyHostToDevice));
+
+    printf("\n--- Full APSEP sweep (IPT x K) ---\n");
+    SweepIPT<1>::run(d_bench_in, d_bench_out, N_BENCH, peak_gbps, baseline_gbps, {1, 1, 0.0});
+
+    // ---- Stack look-back kernel ----
+    printf("\n--- Stack look-back APSEP (correctness) ---\n"); fflush(stdout);
+    {
+        struct TC { const char* name; std::vector<int> data; };
+        TC small_cases[] = {
+            {"single",       {42}},
+            {"two asc",      {1, 2}},
+            {"two desc",     {2, 1}},
+            {"all equal",    {3, 3, 3, 3}},
+            {"ascending",    {1,2,3,4,5,6,7,8}},
+            {"descending",   {8,7,6,5,4,3,2,1}},
+            {"alternating",  {3,1,4,1,5,9,2,6}},
+        };
+        bool ok_stack = true;
+        for (auto& tc : small_cases) {
+            int n = (int)tc.data.size();
+            auto expected = cpuApsep(tc.data);
+            int *d_in, *d_out;
+            gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+            gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+            gpuAssert(cudaMemcpy(d_in, tc.data.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+            launchStackApsep<int, 128, 2>(d_in, d_out, n);
+            std::vector<int> got(n);
+            gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+            cudaFree(d_in); cudaFree(d_out);
+            bool ok = (got == expected);
+            printf("  %-20s %s\n", tc.name, ok ? "PASS" : "FAIL");
+            if (!ok) {
+                for (int i = 0; i < n; i++)
+                    if (got[i] != expected[i])
+                        printf("    i=%d val=%d got=%d expected=%d\n",
+                               i, tc.data[i], got[i], expected[i]);
+            }
+            ok_stack = ok_stack && ok;
+            fflush(stdout);
+        }
+        // Stress test
+        {
+            std::mt19937 rng(42);
+            int nfail = 0;
+            for (int t = 0; t < 200 && nfail == 0; t++) {
+                int n = 1 + rng() % 4096;
+                std::vector<int> h_in(n);
+                for (auto& v : h_in) v = rng() % 1000;
+                auto expected = cpuApsep(h_in);
+                int *d_in, *d_out;
+                gpuAssert(cudaMalloc(&d_in,  n * sizeof(int)));
+                gpuAssert(cudaMalloc(&d_out, n * sizeof(int)));
+                gpuAssert(cudaMemcpy(d_in, h_in.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+                launchStackApsep<int, 128, 2>(d_in, d_out, n);
+                std::vector<int> got(n);
+                gpuAssert(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+                cudaFree(d_in); cudaFree(d_out);
+                for (int i = 0; i < n; i++) {
+                    if (got[i] != expected[i]) {
+                        printf("  STRESS FAIL t=%d i=%d val=%d got=%d expected=%d\n",
+                               t, i, h_in[i], got[i], expected[i]);
+                        nfail++;
+                        break;
+                    }
+                }
+            }
+            printf("  Stress 200x4096: %s\n", nfail == 0 ? "PASS" : "FAIL");
+            ok_stack = ok_stack && (nfail == 0);
+        }
+        printf("  Stack correctness: %s\n\n", ok_stack ? "PASSED" : "FAILED");
+
+        if (ok_stack) {
+            printf("--- Stack look-back APSEP benchmark ---\n"); fflush(stdout);
+            constexpr int BS = 128, IPT = 2;
+            auto scratch = allocStackScratch<int, BS, IPT>(N_BENCH);
+            int warmup = 5, iters = 30;
+            for (int i = 0; i < warmup; i++)
+                runStackApsep<int, BS, IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+            gpuAssert(cudaDeviceSynchronize());
+            std::vector<float> meas(iters);
+            cudaEvent_t t0, t1;
+            gpuAssert(cudaEventCreate(&t0));
+            gpuAssert(cudaEventCreate(&t1));
+            for (int i = 0; i < iters; i++) {
+                gpuAssert(cudaEventRecord(t0));
+                runStackApsep<int, BS, IPT>(d_bench_in, d_bench_out, N_BENCH, scratch);
+                gpuAssert(cudaEventRecord(t1));
+                gpuAssert(cudaEventSynchronize(t1));
+                float ms; gpuAssert(cudaEventElapsedTime(&ms, t0, t1));
+                meas[i] = ms;
+            }
+            gpuAssert(cudaEventDestroy(t0));
+            gpuAssert(cudaEventDestroy(t1));
+            freeStackScratch<int, BS, IPT>(scratch);
+            constexpr int B_stk = BS * IPT;
+            int nb = (N_BENCH + B_stk - 1) / B_stk;
+            int avg_depth = 6;
+            size_t bytes = (size_t)N_BENCH * 2 * sizeof(int)
+                + (size_t)nb * (3 * sizeof(int)
+                    + (size_t)avg_depth * 2 * sizeof(int));
+            printf("  ");
+            computeDescriptors(meas, bytes);
+            printf("\n");
+        }
+    }
+
+    cudaFree(d_bench_in);
+    cudaFree(d_bench_out);
     printf("\n");
 
     bool all_ok = ok1 && ok2 && ok3;
