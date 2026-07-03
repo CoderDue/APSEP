@@ -707,6 +707,18 @@ int main() {
               ([&]{ runWarpScanNoTree<int,128,4,128>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
         freeWarpScanNoTreeScratch<int,128,4,128>(s);
     });
+    timedSection("notree2l-k64-g64 bench (random)", [&]{
+        auto s = allocWarpScanNoTree2LScratch<int,128,4,64,64>(N);
+        BENCH("NoTree2L: IPT=4 K=64 G=64",
+              ([&]{ runWarpScanNoTree2L<int,128,4,64,64>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeWarpScanNoTree2LScratch<int,128,4,64,64>(s);
+    });
+    timedSection("warpcoopleaf-k64 bench (random)", [&]{
+        auto s = allocWarpCoopLeafScratch<int,128,4,64>(N);
+        BENCH("WarpCoopLeaf: IPT=4 K=64",
+              ([&]{ runWarpCoopLeaf<int,128,4,64>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeWarpCoopLeafScratch<int,128,4,64>(s);
+    });
 
     cudaFree(d_in); cudaFree(d_out);
     return 0;

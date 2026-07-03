@@ -307,12 +307,53 @@ of 12 L2-cold pointer-chasing tree hops.
 | WarpScanLeaves K=16 | 43.6 | — | 32K | IPT=2; prior "best" |
 | WarpScanNoTree K=128 (no ldg) | 55.6 | 37.2 | 2K | No SB tree; sequential reads |
 | **WarpScanNoTree K=64 (+__ldg)** | **56.5** | **37.8** | **4K** | **Texture cache for reads** |
+| NoTree2L K=64 G=64 | 54.6 | 36.5 | ~65 | Two-level SB; extra overhead |
+| WarpCoopLeaf K=64 | 40.0 | 26.8 | 4K | ballot overhead > load savings |
 | Persistent-thread | ~0 | ~0 | 192×chunk | Effectively serial |
 
 **WarpScanNoTree K=64** at **56.5 GB/s** (N=32M) / **37.8 GB/s** (N=131M) is
 the best single-pass result (19.6% of peak at N=32M).
 
+---
+
+## Major approaches tried and rejected (2026-07-03)
+
+Three structural changes were implemented and benchmarked against WarpScanNoTree K=64:
+
+### A. Two-level superblock hierarchy (NoTree2L)
+
+Added a super-superblock (SSB) level grouping G=64 SBs.  Serial chain for N=131M
+drops from ~4K to ~65 steps.  Inter-SSB look-back scans G sb_mins then K block_mins
+then B leaves.
+
+**Result: 54.6 / 36.5 GB/s** — slower at both N sizes.
+
+Why: the last-SB-in-SSB must spin-wait on G×K = 4096 earlier blocks before
+publishing the SSB state, adding latency to the critical path.  The intra-SSB scan
+(elements must also scan earlier SBs within the same SSB) duplicates work.
+The 60× fewer serial steps at N=131M don't compensate for the larger per-step
+overhead and the extra spin-wait chain.
+
+### B. Static block assignment + warp-cooperative leaf scan (WarpCoopLeaf)
+
+Removed dynamic block index (`blockIdx.x` instead of atomicAdd).  All 32 threads
+in a warp advance through leaves together, broadcasting one `__ldg` load across all
+lanes.  Each lane compares against its own val; exits when all lanes found answers.
+
+**Result: 40.0 / 26.8 GB/s** — 29% slower at both N sizes.
+
+Why: `__ballot_sync` inside the leaf scan loop costs ~5 cycles per iteration × B=512
+iterations × num_warps_doing_lookback.  The one-load-per-step saving is only ~1-2
+loads per block (random data finds match in ~1.7 iterations), but the ballot overhead
+applies every iteration regardless.  Static assignment also slightly hurts load-balancing.
+
+### C. SB-cooperative intra-SB resolution
+
+Not implemented.  Given that profiling shows the intra-SB spin-waits are not the
+dominant bottleneck (the inter-SB serial chain is), and that both A and B confirmed
+overhead additions outweigh structural gains, Approach C was not pursued.
+
 **Profile-confirmed ceiling**: 55% long-scoreboard stalls from L1 miss latency on
-spin-wait status reads and leaf scans.  The remaining gap to peak is inherent to the
-serial dependency chain — no single-pass algorithm can close it without a
+spin-wait status reads.  The remaining gap to peak is inherent to the serial
+dependency chain — no single-pass algorithm can close it without a
 fundamentally different aggregate structure.

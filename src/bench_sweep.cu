@@ -92,6 +92,24 @@ static void benchWSNT(const int* d_in, int* d_out, int N, long long bytes_rw) {
     freeWarpScanNoTreeScratch<int, BS, IPT, K>(s);
 }
 
+template <int BS, int IPT, int K, int G>
+static void benchWSNT2L(const int* d_in, int* d_out, int N, long long bytes_rw) {
+    char label[80];
+    snprintf(label, sizeof(label), "NoTree2L BS=%d IPT=%d K=%d G=%d", BS, IPT, K, G);
+    auto s = allocWarpScanNoTree2LScratch<int, BS, IPT, K, G>(N);
+    BENCH(label, ([&]{ runWarpScanNoTree2L<int, BS, IPT, K, G>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+    freeWarpScanNoTree2LScratch<int, BS, IPT, K, G>(s);
+}
+
+template <int BS, int IPT, int K>
+static void benchWCL(const int* d_in, int* d_out, int N, long long bytes_rw) {
+    char label[80];
+    snprintf(label, sizeof(label), "WarpCoopLeaf BS=%d IPT=%d K=%d", BS, IPT, K);
+    auto s = allocWarpCoopLeafScratch<int, BS, IPT, K>(N);
+    BENCH(label, ([&]{ runWarpCoopLeaf<int, BS, IPT, K>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+    freeWarpCoopLeafScratch<int, BS, IPT, K>(s);
+}
+
 int main() {
     cudaDeviceProp prop;
     gpuAssert(cudaGetDeviceProperties(&prop, 0));
@@ -139,6 +157,14 @@ int main() {
                "WarpScanNoTree IPT=8 K=64", dc_in, dc_out, NC);
     quickCheck([](int* di, int* dou, int n){ launchWarpScanNoTree<int,256,2,64>(di,dou,n); },
                "WarpScanNoTree BS=256 IPT=2 K=64", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpScanNoTree2L<int,128,4,16,16>(di,dou,n); },
+               "NoTree2L K=16 G=16", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpScanNoTree2L<int,128,4,32,32>(di,dou,n); },
+               "NoTree2L K=32 G=32", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpScanNoTree2L<int,128,4,64,64>(di,dou,n); },
+               "NoTree2L K=64 G=64", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpCoopLeaf<int,128,4,64>(di,dou,n); },
+               "WarpCoopLeaf IPT=4 K=64", dc_in, dc_out, NC);
     cudaFree(dc_in); cudaFree(dc_out);
 
     printf("\n=== WarpScanLeaves K sweep at BS=128 IPT=4 ===\n");
@@ -166,6 +192,16 @@ int main() {
     benchWSNT<128, 2,  8>(d_in, d_out, N, bytes_rw);
     benchWSNT<128, 2, 64>(d_in, d_out, N, bytes_rw);
     benchWSNT<128, 2,128>(d_in, d_out, N, bytes_rw);
+
+    printf("\n=== Approach A: Two-level SB hierarchy (NoTree2L) ===\n");
+    benchWSNT2L<128, 4, 16, 16>(d_in, d_out, N, bytes_rw);
+    benchWSNT2L<128, 4, 32, 32>(d_in, d_out, N, bytes_rw);
+    benchWSNT2L<128, 4, 64, 64>(d_in, d_out, N, bytes_rw);
+
+    printf("\n=== Approach B: Static assign + warp-coop leaf scan (WarpCoopLeaf) ===\n");
+    benchWCL<128, 4,  8>(d_in, d_out, N, bytes_rw);
+    benchWCL<128, 4, 32>(d_in, d_out, N, bytes_rw);
+    benchWCL<128, 4, 64>(d_in, d_out, N, bytes_rw);
 
     printf("\n=== WarpScanNoTree BS=256 IPT=2 (B=512, same tile, more threads) ===\n");
     benchWSNT<256, 2, 32>(d_in, d_out, N, bytes_rw);
