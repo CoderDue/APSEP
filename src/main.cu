@@ -291,14 +291,20 @@ int main() {
     const double peak_gbps = (double)prop.memoryClockRate * 1e3
                            * prop.memoryBusWidth / 8.0 * 2.0 / 1e9;
 
+    // Data format per half: "  123.4 GB/s  1234 MB  12.3%"
+    //   useful:  %6.1f GB/s  -> "  56.7 GB/s" = 11 chars
+    //   logical: %6lld MB    -> "   629 MB"   =  9 chars
+    //   %peak:   %5.1f%%     -> " 19.7%"      =  6 chars
     printf("\n=== Benchmark (N=%d, peak=%.0f GB/s) ===\n", N, peak_gbps);
     printf("  useful GB/s = 2*N*4 / time.  logical MB = all array accesses (tree reads\n");
     printf("  may be L2-cached and not consume full DRAM bandwidth).\n");
-    printf("  %-11s  %-32s  %-32s\n", "", "------------ WSTL ------------", "------------ SPT  ------------");
-    printf("  %-11s  %9s  %10s  %6s  %9s  %10s  %6s\n",
-           "input", "useful", "logical MB", "%peak", "useful", "logical MB", "%peak");
-    printf("  %-11s  %9s  %10s  %6s  %9s  %10s  %6s\n",
-           "-----", "------", "----------", "-----", "------", "----------", "-----");
+    printf("  %-11s  %-29s  %-29s\n", "",
+           "---------- WSTL ----------",
+           "---------- SPT  ----------");
+    printf("  %-11s  %11s  %9s  %6s  %11s  %9s  %6s\n",
+           "input", "useful", "logical", "%peak", "useful", "logical", "%peak");
+    printf("  %-11s  %11s  %9s  %6s  %11s  %9s  %6s\n",
+           "-----", "-----------", "---------", "------", "-----------", "---------", "------");
 
     int ti = 0;
     for (auto& inp : inputs) {
@@ -317,7 +323,7 @@ int main() {
         double useful_w = (double)bytes_rw / (ms_wstl * 1e-3) / 1e9;
         double useful_s = (double)bytes_rw / (ms_spt  * 1e-3) / 1e9;
 
-        printf("  %-11s  %7.1f GB/s  %7lld MB  %5.1f%%  %7.1f GB/s  %7lld MB  %5.1f%%\n",
+        printf("  %-11s  %6.1f GB/s  %6lld MB  %5.1f%%  %6.1f GB/s  %6lld MB  %5.1f%%\n",
                inp.label,
                useful_w, tw / 1000000LL, useful_w / peak_gbps * 100.0,
                useful_s, ts / 1000000LL, useful_s / peak_gbps * 100.0);
