@@ -719,6 +719,168 @@ int main() {
               ([&]{ runWarpCoopLeaf<int,128,4,64>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
         freeWarpCoopLeafScratch<int,128,4,64>(s);
     });
+    timedSection("wmh-ipt4-k64 bench (random)", [&]{
+        auto s = allocWarpMinHierarchyScratch<int,128,4,64>(N);
+        BENCH("WarpMinHierarchy: IPT=4 K=64",
+              ([&]{ runWarpMinHierarchy<int,128,4,64>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeWarpMinHierarchyScratch<int,128,4,64>(s);
+    });
+    timedSection("wmh-ipt4-k128 bench (random)", [&]{
+        auto s = allocWarpMinHierarchyScratch<int,128,4,128>(N);
+        BENCH("WarpMinHierarchy: IPT=4 K=128",
+              ([&]{ runWarpMinHierarchy<int,128,4,128>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeWarpMinHierarchyScratch<int,128,4,128>(s);
+    });
+    timedSection("wstl bench (random)", [&]{
+        auto s = allocWSTLScratch<int,128,4>(N);
+        BENCH("WSTL: IPT=4",
+              ([&]{ runWSTL<int,128,4>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeWSTLScratch<int,128,4>(s);
+    });
+    timedSection("spt-bs128 bench (random)", [&]{
+        auto s = allocSPTScratch<int,128,4>(N);
+        BENCH("SPT: BS=128 IPT=4",
+              ([&]{ runSPT<int,128,4>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeSPTScratch<int,128,4>(s);
+    });
+    timedSection("spt-bs64 bench (random)", [&]{
+        auto s = allocSPTScratch<int,64,4>(N);
+        BENCH("SPT: BS=64 IPT=4",
+              ([&]{ runSPT<int,64,4>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeSPTScratch<int,64,4>(s);
+    });
+    timedSection("bsz-b512 bench (random)", [&]{
+        auto s = allocBSZScratch<int,128,4>(N);
+        BENCH("BSZ two-stage: B=512",
+              ([&]{ runBSZ<int,128,4>(d_in, d_out, N, s); }), bytes_rw, 2, 5);
+        freeBSZScratch<int,128,4>(s);
+    });
+
+    // ---- Worst/best case sections use N2=32M to fit apsepKernel scratch (2.1 GB for N=131M) ----
+    const int N2 = 32 * 1024 * 1024;
+    size_t bytes_rw2 = (size_t)N2 * 2 * sizeof(int);
+
+    // ---- Worst case: sorted descending (every element has PSE = -1) ----
+    {
+        std::vector<int> h_desc(N2);
+        for (int i = 0; i < N2; i++) h_desc[i] = N2 - i;  // N2, N2-1, ..., 1
+        gpuAssert(cudaMemcpy(d_in, h_desc.data(), (size_t)N2 * sizeof(int), cudaMemcpyHostToDevice));
+    }
+
+    printf("\n--- Sorted descending N=32M (worst case: all PSE = -1) ---\n"); fflush(stdout);
+
+    timedSection("apsep-k8 bench (descending)", [&]{
+        auto s = allocApsepScratch<int,128,4,8>(N2);
+        BENCH("apsepKernel (tree+SBtree) K=8 IPT=4",
+              ([&]{ runApsep<int,128,4,8>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeApsepScratch<int,128,4,8>(s);
+    });
+    timedSection("apsep-k64 bench (descending)", [&]{
+        auto s = allocApsepScratch<int,128,4,64>(N2);
+        BENCH("apsepKernel (tree+SBtree) K=64 IPT=4",
+              ([&]{ runApsep<int,128,4,64>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeApsepScratch<int,128,4,64>(s);
+    });
+    timedSection("wsnt-ipt4-k64 bench (descending)", [&]{
+        auto s = allocWarpScanNoTreeScratch<int,128,4,64>(N2);
+        BENCH("WarpScanNoTree: IPT=4 K=64",
+              ([&]{ runWarpScanNoTree<int,128,4,64>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeWarpScanNoTreeScratch<int,128,4,64>(s);
+    });
+    timedSection("wsnt-ipt4-k128 bench (descending)", [&]{
+        auto s = allocWarpScanNoTreeScratch<int,128,4,128>(N2);
+        BENCH("WarpScanNoTree: IPT=4 K=128",
+              ([&]{ runWarpScanNoTree<int,128,4,128>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeWarpScanNoTreeScratch<int,128,4,128>(s);
+    });
+    timedSection("wmh-ipt4-k64 bench (descending)", [&]{
+        auto s = allocWarpMinHierarchyScratch<int,128,4,64>(N2);
+        BENCH("WarpMinHierarchy: IPT=4 K=64",
+              ([&]{ runWarpMinHierarchy<int,128,4,64>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeWarpMinHierarchyScratch<int,128,4,64>(s);
+    });
+    timedSection("wmh-ipt4-k128 bench (descending)", [&]{
+        auto s = allocWarpMinHierarchyScratch<int,128,4,128>(N2);
+        BENCH("WarpMinHierarchy: IPT=4 K=128",
+              ([&]{ runWarpMinHierarchy<int,128,4,128>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeWarpMinHierarchyScratch<int,128,4,128>(s);
+    });
+    timedSection("wstl bench (descending)", [&]{
+        auto s = allocWSTLScratch<int,128,4>(N2);
+        BENCH("WSTL: IPT=4",
+              ([&]{ runWSTL<int,128,4>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeWSTLScratch<int,128,4>(s);
+    });
+    timedSection("spt-bs128 bench (descending)", [&]{
+        auto s = allocSPTScratch<int,128,4>(N2);
+        BENCH("SPT: BS=128 IPT=4",
+              ([&]{ runSPT<int,128,4>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeSPTScratch<int,128,4>(s);
+    });
+    timedSection("spt-bs64 bench (descending)", [&]{
+        auto s = allocSPTScratch<int,64,4>(N2);
+        BENCH("SPT: BS=64 IPT=4",
+              ([&]{ runSPT<int,64,4>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeSPTScratch<int,64,4>(s);
+    });
+    timedSection("bsz bench (descending)", [&]{
+        auto s = allocBSZScratch<int,128,4>(N2);
+        BENCH("BSZ two-stage: B=512",
+              ([&]{ runBSZ<int,128,4>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeBSZScratch<int,128,4>(s);
+    });
+
+    // ---- Best case: sorted ascending (every element has local PSE) ----
+    {
+        std::vector<int> h_asc(N2);
+        for (int i = 0; i < N2; i++) h_asc[i] = i;
+        gpuAssert(cudaMemcpy(d_in, h_asc.data(), (size_t)N2 * sizeof(int), cudaMemcpyHostToDevice));
+    }
+
+    printf("\n--- Sorted ascending N=32M (best case: all PSE local) ---\n"); fflush(stdout);
+
+    timedSection("apsep-k8 bench (ascending)", [&]{
+        auto s = allocApsepScratch<int,128,4,8>(N2);
+        BENCH("apsepKernel (tree+SBtree) K=8 IPT=4",
+              ([&]{ runApsep<int,128,4,8>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeApsepScratch<int,128,4,8>(s);
+    });
+    timedSection("wsnt-ipt4-k64 bench (ascending)", [&]{
+        auto s = allocWarpScanNoTreeScratch<int,128,4,64>(N2);
+        BENCH("WarpScanNoTree: IPT=4 K=64",
+              ([&]{ runWarpScanNoTree<int,128,4,64>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeWarpScanNoTreeScratch<int,128,4,64>(s);
+    });
+    timedSection("wmh-ipt4-k64 bench (ascending)", [&]{
+        auto s = allocWarpMinHierarchyScratch<int,128,4,64>(N2);
+        BENCH("WarpMinHierarchy: IPT=4 K=64",
+              ([&]{ runWarpMinHierarchy<int,128,4,64>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeWarpMinHierarchyScratch<int,128,4,64>(s);
+    });
+    timedSection("wstl bench (ascending)", [&]{
+        auto s = allocWSTLScratch<int,128,4>(N2);
+        BENCH("WSTL: IPT=4",
+              ([&]{ runWSTL<int,128,4>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeWSTLScratch<int,128,4>(s);
+    });
+    timedSection("spt-bs128 bench (ascending)", [&]{
+        auto s = allocSPTScratch<int,128,4>(N2);
+        BENCH("SPT: BS=128 IPT=4",
+              ([&]{ runSPT<int,128,4>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeSPTScratch<int,128,4>(s);
+    });
+    timedSection("spt-bs64 bench (ascending)", [&]{
+        auto s = allocSPTScratch<int,64,4>(N2);
+        BENCH("SPT: BS=64 IPT=4",
+              ([&]{ runSPT<int,64,4>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeSPTScratch<int,64,4>(s);
+    });
+    timedSection("bsz bench (ascending)", [&]{
+        auto s = allocBSZScratch<int,128,4>(N2);
+        BENCH("BSZ two-stage: B=512",
+              ([&]{ runBSZ<int,128,4>(d_in, d_out, N2, s); }), bytes_rw2, 1, 3);
+        freeBSZScratch<int,128,4>(s);
+    });
 
     cudaFree(d_in); cudaFree(d_out);
     return 0;

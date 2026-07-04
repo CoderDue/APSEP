@@ -102,6 +102,15 @@ static void benchWSNT2L(const int* d_in, int* d_out, int N, long long bytes_rw) 
 }
 
 template <int BS, int IPT, int K>
+static void benchWMH(const int* d_in, int* d_out, int N, long long bytes_rw) {
+    char label[80];
+    snprintf(label, sizeof(label), "WarpMinHierarchy BS=%d IPT=%d K=%d", BS, IPT, K);
+    auto s = allocWarpMinHierarchyScratch<int, BS, IPT, K>(N);
+    BENCH(label, ([&]{ runWarpMinHierarchy<int, BS, IPT, K>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+    freeWarpMinHierarchyScratch<int, BS, IPT, K>(s);
+}
+
+template <int BS, int IPT, int K>
 static void benchWCL(const int* d_in, int* d_out, int N, long long bytes_rw) {
     char label[80];
     snprintf(label, sizeof(label), "WarpCoopLeaf BS=%d IPT=%d K=%d", BS, IPT, K);
@@ -165,6 +174,30 @@ int main() {
                "NoTree2L K=64 G=64", dc_in, dc_out, NC);
     quickCheck([](int* di, int* dou, int n){ launchWarpCoopLeaf<int,128,4,64>(di,dou,n); },
                "WarpCoopLeaf IPT=4 K=64", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpMinHierarchy<int,128,4,8>(di,dou,n); },
+               "WarpMinHierarchy IPT=4 K=8", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpMinHierarchy<int,128,4,64>(di,dou,n); },
+               "WarpMinHierarchy IPT=4 K=64", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWarpMinHierarchy<int,128,4,128>(di,dou,n); },
+               "WarpMinHierarchy IPT=4 K=128", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchWSTL<int,128,4>(di,dou,n); },
+               "WSTL IPT=4", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchSPT<int,128,4>(di,dou,n); },
+               "SPT BS=128 IPT=4", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchSPTAtomic<int,128,4>(di,dou,n); },
+               "SPTAtomic BS=128 IPT=4", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchSPT<int,64,4>(di,dou,n); },
+               "SPT BS=64 IPT=4", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchSPT<int,64,2>(di,dou,n); },
+               "SPT BS=64 IPT=2", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchSPT<int,64,8>(di,dou,n); },
+               "SPT BS=64 IPT=8", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchSPT<int,128,2>(di,dou,n); },
+               "SPT BS=128 IPT=2", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchSPT<int,128,8>(di,dou,n); },
+               "SPT BS=128 IPT=8", dc_in, dc_out, NC);
+    quickCheck([](int* di, int* dou, int n){ launchSPT<int,128,16>(di,dou,n); },
+               "SPT BS=128 IPT=16", dc_in, dc_out, NC);
     cudaFree(dc_in); cudaFree(dc_out);
 
     printf("\n=== WarpScanLeaves K sweep at BS=128 IPT=4 ===\n");
@@ -222,6 +255,110 @@ int main() {
     printf("\n=== Reference: WSL IPT=2 K=16 and WSNT IPT=4 K=128 ===\n");
     benchWSL<128, 2, 16>(d_in, d_out, N, bytes_rw);
     benchWSNT<128, 4,128>(d_in, d_out, N, bytes_rw);
+
+    printf("\n=== WarpMinHierarchy K sweep at BS=128 IPT=4 ===\n");
+    benchWMH<128, 4,  8>(d_in, d_out, N, bytes_rw);
+    benchWMH<128, 4, 32>(d_in, d_out, N, bytes_rw);
+    benchWMH<128, 4, 64>(d_in, d_out, N, bytes_rw);
+    benchWMH<128, 4,128>(d_in, d_out, N, bytes_rw);
+    benchWMH<128, 4,256>(d_in, d_out, N, bytes_rw);
+
+    printf("\n=== WSTL (two-pass: intra-block + tree lookup) ===\n");
+    {
+        auto s = allocWSTLScratch<int,128,4>(N);
+        BENCH("WSTL IPT=4 B=512",
+              ([&]{ runWSTL<int,128,4>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+        freeWSTLScratch<int,128,4>(s);
+    }
+
+    printf("\n=== SPT BS/IPT sweep (cooperative: grid.sync tree build) ===\n");
+    {
+        // BS=128, IPT=4 (baseline: 192 physical blocks, B=512)
+        {
+            auto s = allocSPTScratch<int,128,4>(N);
+            printf("  SPT BS=128 IPT=4: %d phys blocks, B=512\n", s.num_phys);
+            BENCH("SPT BS=128 IPT=4 B=512",
+                  ([&]{ runSPT<int,128,4>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+            freeSPTScratch<int,128,4>(s);
+        }
+        // BS=64, IPT=4 (384 physical blocks, B=256) — 16 blocks/SM vs 8
+        {
+            auto s = allocSPTScratch<int,64,4>(N);
+            printf("  SPT BS=64 IPT=4: %d phys blocks, B=256\n", s.num_phys);
+            BENCH("SPT BS=64 IPT=4 B=256",
+                  ([&]{ runSPT<int,64,4>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+            freeSPTScratch<int,64,4>(s);
+        }
+        // BS=64, IPT=2 (384 physical blocks, B=128)
+        {
+            auto s = allocSPTScratch<int,64,2>(N);
+            printf("  SPT BS=64 IPT=2: %d phys blocks, B=128\n", s.num_phys);
+            BENCH("SPT BS=64 IPT=2 B=128",
+                  ([&]{ runSPT<int,64,2>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+            freeSPTScratch<int,64,2>(s);
+        }
+        // BS=64, IPT=8 (384 physical blocks, B=512)
+        {
+            auto s = allocSPTScratch<int,64,8>(N);
+            printf("  SPT BS=64 IPT=8: %d phys blocks, B=512\n", s.num_phys);
+            BENCH("SPT BS=64 IPT=8 B=512",
+                  ([&]{ runSPT<int,64,8>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+            freeSPTScratch<int,64,8>(s);
+        }
+        // BS=128, IPT=2 (192 physical blocks, B=256)
+        {
+            auto s = allocSPTScratch<int,128,2>(N);
+            printf("  SPT BS=128 IPT=2: %d phys blocks, B=256\n", s.num_phys);
+            BENCH("SPT BS=128 IPT=2 B=256",
+                  ([&]{ runSPT<int,128,2>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+            freeSPTScratch<int,128,2>(s);
+        }
+        // BS=128, IPT=8 (192 physical blocks, B=1024) — 2x fewer logical blocks
+        {
+            auto s = allocSPTScratch<int,128,8>(N);
+            printf("  SPT BS=128 IPT=8: %d phys blocks, B=1024\n", s.num_phys);
+            BENCH("SPT BS=128 IPT=8 B=1024",
+                  ([&]{ runSPT<int,128,8>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+            freeSPTScratch<int,128,8>(s);
+        }
+        // BS=128, IPT=16 (192 physical blocks, B=2048) — 4x fewer logical blocks
+        {
+            auto s = allocSPTScratch<int,128,16>(N);
+            printf("  SPT BS=128 IPT=16: %d phys blocks, B=2048\n", s.num_phys);
+            BENCH("SPT BS=128 IPT=16 B=2048",
+                  ([&]{ runSPT<int,128,16>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+            freeSPTScratch<int,128,16>(s);
+        }
+    }
+
+    printf("\n=== SPTAtomic (atomicMin tree build, no Phase 2 grid.syncs) ===\n");
+    {
+        auto s = allocSPTScratch<int,128,4>(N);
+        int bps = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, apsepKernelSPTAtomic<int,128,4>, 128, 0);
+        cudaDeviceProp prop; cudaGetDeviceProperties(&prop, 0);
+        printf("  SPTAtomic BS=128 IPT=4: %d phys blocks, B=512\n", bps * prop.multiProcessorCount);
+        BENCH("SPTAtomic BS=128 IPT=4 B=512",
+              ([&]{ runSPTAtomic<int,128,4>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+        freeSPTScratch<int,128,4>(s);
+    }
+
+    printf("\n=== BSZ two-stage ===\n");
+    {
+        // Correctness check first
+        int *dc_bsz_in, *dc_bsz_out;
+        gpuAssert(cudaMalloc(&dc_bsz_in,  8192 * sizeof(int)));
+        gpuAssert(cudaMalloc(&dc_bsz_out, 8192 * sizeof(int)));
+        quickCheck([](int* di, int* dou, int n){ launchBSZ<int,128,4>(di,dou,n); },
+                   "BSZ B=512", dc_bsz_in, dc_bsz_out, 8192);
+        cudaFree(dc_bsz_in); cudaFree(dc_bsz_out);
+        // Benchmark
+        auto s = allocBSZScratch<int,128,4>(N);
+        char label[80];
+        snprintf(label, sizeof(label), "BSZ two-stage B=512");
+        BENCH(label, ([&]{ runBSZ<int,128,4>(d_in, d_out, N, s); }), bytes_rw, 2, 7);
+        freeBSZScratch<int,128,4>(s);
+    }
 
     cudaFree(d_in);
     cudaFree(d_out);

@@ -7,6 +7,7 @@ NVCCFLAGS   := $(CXXSTD) -arch=sm_$(CUDA_ARCH) --ptxas-options=-v \
 TARGET           := apsep_test
 BENCH_TARGET     := bench_variants
 PROFILE_TARGET   := profile_lookback
+PROFILE_WSNT_TARGET := profile_wsnt
 APPROACHES_TARGET := bench_approaches
 SWEEP_TARGET     := bench_sweep
 SRC              := src/main.cu
@@ -16,7 +17,7 @@ APPROACHES_SRC   := src/bench_approaches.cu
 SWEEP_SRC        := src/bench_sweep.cu
 INCLUDES         := -Isrc
 
-.PHONY: all bench profile approaches bench_sweep clean
+.PHONY: all bench profile approaches bench_sweep profile_wsnt clean
 
 all: $(TARGET)
 
@@ -41,5 +42,24 @@ $(APPROACHES_TARGET): $(APPROACHES_SRC) src/apsep.cuh
 $(SWEEP_TARGET): $(SWEEP_SRC) src/apsep.cuh
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SWEEP_SRC)
 
+$(PROFILE_WSNT_TARGET): src/profile_wsnt.cu src/apsep.cuh
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ src/profile_wsnt.cu
+
+SPT_WORST_TARGET := bench_spt_worst
+SPT_WORST_SRC    := src/bench_spt_worst.cu
+
+SPT_PHASES_TARGET := bench_spt_phases
+SPT_PHASES_SRC    := src/bench_spt_phases.cu
+
+bench_spt_phases: $(SPT_PHASES_TARGET)
+
+$(SPT_PHASES_TARGET): $(SPT_PHASES_SRC) src/apsep.cuh
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SPT_PHASES_SRC)
+
+bench_spt_worst: $(SPT_WORST_TARGET)
+
+$(SPT_WORST_TARGET): $(SPT_WORST_SRC) src/apsep.cuh
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SPT_WORST_SRC)
+
 clean:
-	rm -f $(TARGET) $(BENCH_TARGET) $(PROFILE_TARGET) $(APPROACHES_TARGET) $(SWEEP_TARGET)
+	rm -f $(TARGET) $(BENCH_TARGET) $(PROFILE_TARGET) $(APPROACHES_TARGET) $(SWEEP_TARGET) $(SPT_WORST_TARGET)

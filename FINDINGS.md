@@ -309,6 +309,7 @@ of 12 L2-cold pointer-chasing tree hops.
 | **WarpScanNoTree K=64 (+__ldg)** | **56.5** | **37.8** | **4K** | **Texture cache for reads** |
 | NoTree2L K=64 G=64 | 54.6 | 36.5 | ~65 | Two-level SB; extra overhead |
 | WarpCoopLeaf K=64 | 40.0 | 26.8 | 4K | ballot overhead > load savings |
+| BSZ two-stage (B=512) | — | 4.1 | 0 | No serial chain; tree I/O kills it |
 | Persistent-thread | ~0 | ~0 | 192×chunk | Effectively serial |
 
 **WarpScanNoTree K=64** at **56.5 GB/s** (N=32M) / **37.8 GB/s** (N=131M) is
@@ -352,6 +353,52 @@ applies every iteration regardless.  Static assignment also slightly hurts load-
 Not implemented.  Given that profiling shows the intra-SB spin-waits are not the
 dominant bottleneck (the inter-SB serial chain is), and that both A and B confirmed
 overhead additions outweigh structural gains, Approach C was not pursued.
+
+### D. BSZ two-stage algorithm (Sitchinava & Svenning, SPAA '24)
+
+Implements the BSZ algorithm adapted for GPU (two-stage):
+
+- **Stage 1** (`bszStage1Kernel`): Each CTA runs the sequential SEQ monotone-stack
+  algorithm on one tile of B=512 elements.  Local matches are written to `d_out`;
+  non-local elements are marked with sentinel `INT_MIN`.
+- **Stage 2** (`bszBuildTreeKernel` + `bszReduceLevelKernel`): A global segment-min
+  tree of size 2M (M = next power-of-2 ≥ n) is built over `d_in` in O(log n) kernel
+  launches.
+- **Stage 3** (`bszNonlocalKernel`): Each non-local element independently queries
+  the segment-min tree to find "rightmost j < i with d_in[j] < d_in[i]" in O(log n)
+  steps — no inter-thread dependency (Observation 1 of the paper: matches are
+  non-overlapping).
+
+**Result: 4.1 GB/s (N=131M)** — 9× slower than WarpScanNoTree K=64.
+
+**Why BSZ fails on GPU despite eliminating the serial chain:**
+
+1. **Tree build overhead**: Building the global segment-min tree requires ⌈log₂(131M)⌉ = 27
+   separate kernel launches with implicit global barriers between each level.  This alone
+   adds ~20 ms of kernel-launch overhead per call.
+
+2. **Random access in tree query**: Each of the ~80M non-local elements (random data →
+   ~60% non-local) independently traverses 27 levels of the tree, following 27 random
+   pointer-chasing reads through a 1 GB tree.  The GPU's 1.5 MB L2 holds only the top
+   ~18 levels; the bottom 9 levels (256 MB) are always L2-cold, producing ~80M × 9 = 720M
+   L2 misses at 200 cycles each.
+
+3. **No prefetching**: Each element follows a different path through the tree depending
+   on its value and position.  The GPU's hardware prefetcher (effective on sequential
+   streams like the WarpScanNoTree look-back) is useless for these divergent accesses.
+
+**Why BSZ works on CPU but not GPU**: The CPUs in the paper's experiments (48-thread Xeon,
+126 GB RAM, 16 MB L3 cache) can hold the top ~22 tree levels in L3 (16 MB covers
+16M × 4 bytes = 64 MB of nodes — slightly short, but cache sharing across cores helps).
+Furthermore, CPUs have hardware branch predictors optimized for tree traversal and can
+speculatively prefetch sibling nodes.  None of these advantages transfer to GPU L2.
+
+**Trade-off summary**: BSZ achieves O(n(1 + log n/k)) work and O(k(1 + log n/k)) span,
+which is theoretically superior to the WarpScanNoTree's O(n) work with O(n/K) span.
+But on GPU, the constant factors in the tree I/O dominate for the relevant range of n.
+The sequential look-back's predictable access pattern — packed 4-byte block_mins read
+left-to-right, then a linear leaf scan — is far more GPU-cache-friendly than logarithmic
+tree traversal, even though it has a longer serial chain.
 
 **Profile-confirmed ceiling**: 55% long-scoreboard stalls from L1 miss latency on
 spin-wait status reads.  The remaining gap to peak is inherent to the serial

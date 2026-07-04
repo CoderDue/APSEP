@@ -1970,6 +1970,1198 @@ void launchWarpScanNoTree(const T* d_in, int* d_out, int n) {
 }
 
 // ===========================================================================
+// WarpMinHierarchy APSEP
+//
+// Like WarpScanNoTree but replaces the flat B-element leaf array with a
+// two-level structure per block:
+//   d_block_warp_mins[num_blocks * W]  – W = B/32 warp-min values (packed T)
+//   d_block_leaves[num_blocks * B]     – B full leaf values
+//
+// The backward leaf scan becomes:
+//   1. Scan W warp-mins backward to find the rightmost matching warp (W reads,
+//      all in 1-2 cache lines since W=16 for B=512).
+//   2. Scan that warp's 32 leaves backward (32 reads = 1 cache line).
+//
+// This vs WarpScanNoTree: instead of scanning up to B=512 leaves with 9.2/32
+// sector utilization (early exit leaves most of each cache line unused), we
+// scan W=16 warp-mins (100% utilization, 1 cache line) then exactly 32 leaves
+// (100% utilization, 1 cache line).  Expected ~4-5x reduction in L1/L2 traffic
+// for the leaf-scan phase on random data.
+// ===========================================================================
+
+template <typename T, int B, int K>
+__device__ int decoupledLookbackWarpMin(
+        int                             sb_id,
+        T                               val,
+        const SuperBlockState<T>*       d_sb_states,
+        const T* __restrict__           d_block_mins,
+        const T* __restrict__           d_block_warp_mins,  // W = B/32 entries per block
+        const T* __restrict__           d_block_leaves,
+        int                             num_blocks) {
+    constexpr int W = B / 32;  // number of warps per block
+
+    for (int sb = sb_id - 1; sb >= 0; sb--) {
+        while (d_sb_states[sb].status == APSEP_INVALID) { /* spin */ }
+        if (d_sb_states[sb].sb_min >= val) continue;
+
+        int sb_first = sb * K;
+        int sb_last  = min(sb_first + K, num_blocks) - 1;
+
+        for (int b = sb_last; b >= sb_first; b--) {
+            if (__ldg(&d_block_mins[b]) < val) {
+                const T* wm = d_block_warp_mins + (size_t)b * W;
+                // Find rightmost matching warp
+                for (int w = W - 1; w >= 0; w--) {
+                    if (__ldg(&wm[w]) < val) {
+                        const T* bl = d_block_leaves + (size_t)b * B + w * 32;
+                        for (int k = 31; k >= 0; k--)
+                            if (__ldg(&bl[k]) < val) return b * B + w * 32 + k;
+                    }
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+template <typename T, int BLOCK_SIZE, int IPT, int K>
+__global__
+void apsepKernelWarpMinHierarchy(
+        const T* __restrict__   d_in,
+        int*                    d_out,
+        int                     n,
+        int                     num_blocks,
+        int                     num_superblocks,
+        BlockState<T>*          d_states,
+        T* __restrict__         d_block_leaves,
+        T* __restrict__         d_block_mins,
+        T* __restrict__         d_block_warp_mins,  // W = B/32 entries per block
+        SuperBlockState<T>*     d_sb_states,
+        volatile uint32_t*      d_dyn_idx) {
+
+    constexpr int B         = BLOCK_SIZE * IPT;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    constexpr int W         = B / 32;  // warp-mins per block = NUM_WARPS * IPT
+    const     T   INF       = ApsepInfinity<T>::value();
+
+    __shared__ uint32_t s_bid;
+    __shared__ T        s_elems[B];
+    __shared__ T        s_stripe_min[IPT][NUM_WARPS];
+
+    if (threadIdx.x == 0)
+        s_bid = atomicAdd(const_cast<uint32_t*>(d_dyn_idx), 1u);
+    __syncthreads();
+
+    const int block_id = (int)s_bid;
+    const int glb_offs = block_id * B;
+    const int sb_id    = block_id / K;
+    const int sb_local = block_id % K;
+    const int sb_first = sb_id * K;
+    const int lane     = threadIdx.x & 31;
+    const int warp_id  = threadIdx.x >> 5;
+
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) {
+        int lid = i * BLOCK_SIZE + threadIdx.x;
+        int gid = glb_offs + lid;
+        s_elems[lid] = (gid < n) ? d_in[gid] : INF;
+    }
+    __syncthreads();
+
+    T left_carry[IPT];
+    #pragma unroll
+    for (int ipt = 0; ipt < IPT; ipt++) {
+        T c = s_elems[ipt * BLOCK_SIZE + threadIdx.x];
+        #pragma unroll
+        for (int step = 1; step <= 16; step <<= 1) {
+            T nb = __shfl_up_sync(0xffffffff, c, step);
+            if (lane >= step) c = min(c, nb);
+        }
+        left_carry[ipt] = __shfl_up_sync(0xffffffff, c, 1);
+        T wm = __shfl_sync(0xffffffff, c, 31);
+        if (lane == 0) s_stripe_min[ipt][warp_id] = wm;
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int ipt = 0; ipt < IPT; ipt++) {
+        int lid = ipt * BLOCK_SIZE + threadIdx.x;
+        int gid = glb_offs + lid;
+        if (gid >= n) continue;
+        T val = s_elems[lid];
+        int result = -1;
+
+        if (lane > 0 && left_carry[ipt] < val) {
+            int base = ipt * BLOCK_SIZE + warp_id * 32;
+            for (int k = lane - 1; k >= 0; k--)
+                if (s_elems[base + k] < val) { result = base + k; break; }
+        }
+        if (result < 0) {
+            for (int w = warp_id - 1; w >= 0 && result < 0; w--) {
+                if (s_stripe_min[ipt][w] < val) {
+                    int wb = ipt * BLOCK_SIZE + w * 32;
+                    for (int k = 31; k >= 0; k--)
+                        if (s_elems[wb + k] < val) { result = wb + k; break; }
+                }
+            }
+        }
+        if (result < 0) {
+            for (int i = ipt - 1; i >= 0 && result < 0; i--) {
+                for (int w = NUM_WARPS - 1; w >= 0 && result < 0; w--) {
+                    if (s_stripe_min[i][w] < val) {
+                        int wb = i * BLOCK_SIZE + w * 32;
+                        for (int k = 31; k >= 0; k--)
+                            if (s_elems[wb + k] < val) { result = wb + k; break; }
+                    }
+                }
+            }
+        }
+        d_out[gid] = (result >= 0) ? (glb_offs + result) : INT_MIN;
+    }
+
+    // Publish leaves
+    T* g_leaves = d_block_leaves + (size_t)block_id * B;
+    for (int i = threadIdx.x; i < B; i += BLOCK_SIZE)
+        g_leaves[i] = s_elems[i];
+
+    // Publish per-warp mins: each warp stores its warp-min from s_stripe_min.
+    // Layout: d_block_warp_mins[block_id * W + ipt * NUM_WARPS + warp_id]
+    // All W = IPT * NUM_WARPS entries written by separate warps.
+    if (lane == 0) {
+        T* g_wm = d_block_warp_mins + (size_t)block_id * W;
+        for (int ipt = 0; ipt < IPT; ipt++)
+            g_wm[ipt * NUM_WARPS + warp_id] = s_stripe_min[ipt][warp_id];
+    }
+    __threadfence();
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        T bmin = s_stripe_min[0][0];
+        for (int ipt = 0; ipt < IPT; ipt++)
+            for (int w = 0; w < NUM_WARPS; w++)
+                bmin = min(bmin, s_stripe_min[ipt][w]);
+        d_block_mins[block_id] = bmin;
+        d_states[block_id].block_min = bmin;
+        __threadfence();
+        d_states[block_id].status = APSEP_READY;
+    }
+    __syncthreads();
+
+    int sb_size = min(K, num_blocks - sb_first);
+    bool is_last_in_sb = (sb_local == sb_size - 1);
+
+    if (is_last_in_sb) {
+        for (int b = sb_first; b < block_id; b++)
+            while (d_states[b].status == APSEP_INVALID) { /* spin */ }
+
+        if (threadIdx.x == 0) {
+            T sb_min = d_block_mins[sb_first];
+            for (int b = sb_first + 1; b <= block_id; b++)
+                sb_min = min(sb_min, d_block_mins[b]);
+            __threadfence();
+            d_sb_states[sb_id].sb_min = sb_min;
+            __threadfence();
+            d_sb_states[sb_id].status = APSEP_READY;
+        }
+    }
+    __syncthreads();
+
+    // Decoupled look-back using warp-min hierarchy
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) {
+        int lid = i * BLOCK_SIZE + threadIdx.x;
+        int gid = glb_offs + lid;
+        if (gid < n && d_out[gid] == INT_MIN) {
+            T val = s_elems[lid];
+            int result = -1;
+
+            // Intra-SB: spin on per-block status, then warp-min hierarchy
+            for (int b = block_id - 1; b >= sb_first && result < 0; b--) {
+                while (d_states[b].status == APSEP_INVALID) { /* spin */ }
+                if (__ldg(&d_block_mins[b]) < val) {
+                    constexpr int W_local = B / 32;
+                    const T* wm = d_block_warp_mins + (size_t)b * W_local;
+                    for (int w = W_local - 1; w >= 0; w--) {
+                        if (__ldg(&wm[w]) < val) {
+                            const T* bl = d_block_leaves + (size_t)b * B + w * 32;
+                            for (int k = 31; k >= 0; k--)
+                                if (__ldg(&bl[k]) < val) { result = b * B + w * 32 + k; break; }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (result < 0)
+                result = decoupledLookbackWarpMin<T, B, K>(
+                    sb_id, val, d_sb_states, d_block_mins, d_block_warp_mins,
+                    d_block_leaves, num_blocks);
+
+            d_out[gid] = result;
+        }
+    }
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+struct ApsepWarpMinHierarchyScratch {
+    BlockState<T>*      d_states          = nullptr;
+    T*                  d_block_leaves    = nullptr;
+    T*                  d_block_mins      = nullptr;
+    T*                  d_block_warp_mins = nullptr;
+    SuperBlockState<T>* d_sb_states       = nullptr;
+    uint32_t*           d_dyn_idx         = nullptr;
+    int                 num_blocks        = 0;
+    int                 num_superblocks   = 0;
+};
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+ApsepWarpMinHierarchyScratch<T, BLOCK_SIZE, IPT, K> allocWarpMinHierarchyScratch(int n) {
+    constexpr int B = BLOCK_SIZE * IPT;
+    constexpr int W = B / 32;
+
+    ApsepWarpMinHierarchyScratch<T, BLOCK_SIZE, IPT, K> s;
+    s.num_blocks      = (n + B - 1) / B;
+    s.num_superblocks = (s.num_blocks + K - 1) / K;
+
+    gpuAssert(cudaMalloc(&s.d_states,          (size_t)s.num_blocks      * sizeof(BlockState<T>)));
+    gpuAssert(cudaMalloc(&s.d_block_leaves,    (size_t)s.num_blocks      * B  * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_block_mins,      (size_t)s.num_blocks          * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_block_warp_mins, (size_t)s.num_blocks      * W  * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_sb_states,       (size_t)s.num_superblocks * sizeof(SuperBlockState<T>)));
+    gpuAssert(cudaMalloc(&s.d_dyn_idx,         sizeof(uint32_t)));
+    return s;
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+void freeWarpMinHierarchyScratch(ApsepWarpMinHierarchyScratch<T, BLOCK_SIZE, IPT, K>& s) {
+    cudaFree(s.d_states);
+    cudaFree(s.d_block_leaves);
+    cudaFree(s.d_block_mins);
+    cudaFree(s.d_block_warp_mins);
+    cudaFree(s.d_sb_states);
+    cudaFree(s.d_dyn_idx);
+    s = ApsepWarpMinHierarchyScratch<T, BLOCK_SIZE, IPT, K>{};
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+void runWarpMinHierarchy(const T* d_in, int* d_out, int n,
+                         ApsepWarpMinHierarchyScratch<T, BLOCK_SIZE, IPT, K>& s) {
+    gpuAssert(cudaMemset(s.d_states,    0, (size_t)s.num_blocks      * sizeof(BlockState<T>)));
+    gpuAssert(cudaMemset(s.d_sb_states, 0, (size_t)s.num_superblocks * sizeof(SuperBlockState<T>)));
+    gpuAssert(cudaMemset(s.d_dyn_idx,   0, sizeof(uint32_t)));
+
+    apsepKernelWarpMinHierarchy<T, BLOCK_SIZE, IPT, K>
+        <<<s.num_blocks, BLOCK_SIZE>>>(
+            d_in, d_out, n, s.num_blocks, s.num_superblocks,
+            s.d_states, s.d_block_leaves, s.d_block_mins, s.d_block_warp_mins,
+            s.d_sb_states, s.d_dyn_idx);
+
+    gpuAssert(cudaGetLastError());
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 2, int K = 8>
+void launchWarpMinHierarchy(const T* d_in, int* d_out, int n) {
+    if (n <= 0) return;
+    auto s = allocWarpMinHierarchyScratch<T, BLOCK_SIZE, IPT, K>(n);
+    runWarpMinHierarchy<T, BLOCK_SIZE, IPT, K>(d_in, d_out, n, s);
+    gpuAssert(cudaDeviceSynchronize());
+    freeWarpMinHierarchyScratch<T, BLOCK_SIZE, IPT, K>(s);
+}
+
+// ===========================================================================
+// WarpScanTreeLookup (WSTL) — two-pass hybrid
+//
+// Problem: worst-case descending input makes all spin-based single-pass
+// kernels collapse to ~1 GB/s because blocks spin-wait on a O(N/B) serial
+// chain.  NCU confirms: 99%+ of samples are on ISETP.NE.AND status checks.
+//
+// Solution: decouple the intra-block phase from the inter-block look-back.
+//   Pass 1: One kernel handles intra-block PSE (fully parallel, no waits).
+//           Thread 0 writes block_min and B leaves; marks INT_MIN in d_out
+//           for elements needing inter-block look-back.  No spin-waits at all.
+//   Pass 2: Build a 0-indexed segment min-tree over d_block_mins[num_blocks].
+//           Uses ceil-to-power-of-2 leaves; tree has 2*M-1 nodes.
+//           For N=131M: num_blocks=256K, tree ≈ 2 MB — fits in L2 cache.
+//   Pass 3: Each element with d_out==INT_MIN queries the tree to find the
+//           rightmost block with a smaller element, then linearly scans that
+//           block's W warp-mins + 32 leaves.  Fully parallel, O(log num_blocks)
+//           tree traversal, input-independent cost.
+//
+// vs BSZ: BSZ builds a tree over all N elements (N=131M → 512 MB tree,
+// doesn't fit in L2).  WSTL builds a tree over num_blocks=256K block_mins
+// (2 MB tree, fits in L2), then does one block-leaf scan.  Should be faster.
+// ===========================================================================
+
+// --- Pass 1: intra-block only, no spin-wait ---
+template <typename T, int BLOCK_SIZE, int IPT>
+__global__
+void wstlPass1Kernel(
+        const T* __restrict__   d_in,
+        int*                    d_out,
+        int                     n,
+        int                     num_blocks,
+        T* __restrict__         d_block_leaves,
+        T* __restrict__         d_block_mins,
+        T* __restrict__         d_block_warp_mins) {
+
+    constexpr int B         = BLOCK_SIZE * IPT;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    constexpr int W         = B / 32;
+    const     T   INF       = ApsepInfinity<T>::value();
+
+    const int block_id = (int)blockIdx.x;
+    const int glb_offs = block_id * B;
+    const int lane     = threadIdx.x & 31;
+    const int warp_id  = threadIdx.x >> 5;
+
+    __shared__ T s_elems[B];
+    __shared__ T s_stripe_min[IPT][NUM_WARPS];
+
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) {
+        int lid = i * BLOCK_SIZE + threadIdx.x;
+        int gid = glb_offs + lid;
+        s_elems[lid] = (gid < n) ? d_in[gid] : INF;
+    }
+    __syncthreads();
+
+    T left_carry[IPT];
+    #pragma unroll
+    for (int ipt = 0; ipt < IPT; ipt++) {
+        T c = s_elems[ipt * BLOCK_SIZE + threadIdx.x];
+        #pragma unroll
+        for (int step = 1; step <= 16; step <<= 1) {
+            T nb = __shfl_up_sync(0xffffffff, c, step);
+            if (lane >= step) c = min(c, nb);
+        }
+        left_carry[ipt] = __shfl_up_sync(0xffffffff, c, 1);
+        T wm = __shfl_sync(0xffffffff, c, 31);
+        if (lane == 0) s_stripe_min[ipt][warp_id] = wm;
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int ipt = 0; ipt < IPT; ipt++) {
+        int lid = ipt * BLOCK_SIZE + threadIdx.x;
+        int gid = glb_offs + lid;
+        if (gid >= n) continue;
+        T val = s_elems[lid];
+        int result = -1;
+
+        if (lane > 0 && left_carry[ipt] < val) {
+            int base = ipt * BLOCK_SIZE + warp_id * 32;
+            for (int k = lane - 1; k >= 0; k--)
+                if (s_elems[base + k] < val) { result = base + k; break; }
+        }
+        if (result < 0) {
+            for (int w = warp_id - 1; w >= 0 && result < 0; w--) {
+                if (s_stripe_min[ipt][w] < val) {
+                    int wb = ipt * BLOCK_SIZE + w * 32;
+                    for (int k = 31; k >= 0; k--)
+                        if (s_elems[wb + k] < val) { result = wb + k; break; }
+                }
+            }
+        }
+        if (result < 0) {
+            for (int i = ipt - 1; i >= 0 && result < 0; i--) {
+                for (int w = NUM_WARPS - 1; w >= 0 && result < 0; w--) {
+                    if (s_stripe_min[i][w] < val) {
+                        int wb = i * BLOCK_SIZE + w * 32;
+                        for (int k = 31; k >= 0; k--)
+                            if (s_elems[wb + k] < val) { result = wb + k; break; }
+                    }
+                }
+            }
+        }
+        // Mark INT_MIN if needs inter-block look-back, else write global index
+        d_out[gid] = (result >= 0) ? (glb_offs + result) : INT_MIN;
+    }
+
+    // Publish leaves and warp-mins
+    T* g_leaves = d_block_leaves + (size_t)block_id * B;
+    for (int i = threadIdx.x; i < B; i += BLOCK_SIZE)
+        g_leaves[i] = s_elems[i];
+
+    if (lane == 0) {
+        T* g_wm = d_block_warp_mins + (size_t)block_id * W;
+        for (int ipt = 0; ipt < IPT; ipt++)
+            g_wm[ipt * NUM_WARPS + warp_id] = s_stripe_min[ipt][warp_id];
+    }
+
+    if (threadIdx.x == 0) {
+        T bmin = s_stripe_min[0][0];
+        for (int ipt = 0; ipt < IPT; ipt++)
+            for (int w = 0; w < NUM_WARPS; w++)
+                bmin = min(bmin, s_stripe_min[ipt][w]);
+        d_block_mins[block_id] = bmin;
+    }
+}
+
+// --- Pass 2: build segment min-tree over d_block_mins[num_blocks] ---
+// 0-indexed tree: root=0, left=2i+1, right=2i+2, leaves at [M-1..2M-2].
+// M = next power of two >= num_blocks.
+
+template <typename T>
+__global__
+void wstlFillLeavesKernel(
+        const T* __restrict__ d_block_mins,
+        T* __restrict__       d_tree,
+        int                   num_blocks,
+        int                   leaf_offset,  // = M-1
+        int                   M) {
+    const T INF = ApsepInfinity<T>::value();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= M) return;
+    d_tree[leaf_offset + i] = (i < num_blocks) ? d_block_mins[i] : INF;
+}
+
+template <typename T>
+__global__
+void wstlReduceLevelKernel(T* __restrict__ d_tree, int level_start, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int node = level_start + i;
+    d_tree[node] = min(d_tree[2 * node + 1], d_tree[2 * node + 2]);
+}
+
+// --- Pass 3: tree query + leaf scan for elements needing inter-block lookup ---
+// For each element with d_out==INT_MIN, do Futhark-style ascent+descent on
+// the block-level segment tree to find the rightmost block with val-in[i],
+// then scan that block's warp-mins and leaves.
+template <typename T, int B>
+__device__ int wstlTreeQuery(
+        const T* __restrict__ d_tree,
+        int                   leaf_offset,  // M-1
+        int                   block_id,     // query must be in [0, block_id-1]
+        T                     val) {
+    // Start at the leaf for block_id and ascend, looking left
+    int node = leaf_offset + block_id;
+    while (node > 0) {
+        bool is_right = (node % 2 == 0);
+        if (is_right) {
+            int left_sib = node - 1;
+            if (d_tree[left_sib] < val) {
+                // Descend into left sibling preferring right child
+                node = left_sib;
+                while (node < leaf_offset) {
+                    int rc = 2 * node + 2;
+                    node = (d_tree[rc] < val) ? rc : (2 * node + 1);
+                }
+                return node - leaf_offset;  // block index
+            }
+        }
+        node = (node - 1) / 2;
+    }
+    return -1;
+}
+
+template <typename T, int BLOCK_SIZE, int IPT>
+__global__
+void wstlPass3Kernel(
+        const T* __restrict__   d_in,
+        int*                    d_out,
+        int                     n,
+        int                     num_blocks,
+        const T* __restrict__   d_block_leaves,
+        const T* __restrict__   d_block_mins,
+        const T* __restrict__   d_block_warp_mins,
+        const T* __restrict__   d_tree,
+        int                     leaf_offset) {
+
+    constexpr int B = BLOCK_SIZE * IPT;
+    constexpr int W = B / 32;
+
+    const int block_id = (int)blockIdx.x;
+    const int glb_offs = block_id * B;
+
+    for (int i = threadIdx.x; i < B; i += BLOCK_SIZE) {
+        int gid = glb_offs + i;
+        if (gid >= n) continue;
+        if (d_out[gid] != INT_MIN) continue;  // already resolved intra-block
+
+        T val = d_in[gid];
+
+        // Tree query: find rightmost block b < block_id with block_min < val
+        int b = wstlTreeQuery<T, B>(d_tree, leaf_offset, block_id, val);
+        if (b < 0) { d_out[gid] = -1; continue; }
+
+        // Scan warp-mins then leaves within block b
+        const T* wm = d_block_warp_mins + (size_t)b * W;
+        int result = -1;
+        for (int w = W - 1; w >= 0 && result < 0; w--) {
+            if (__ldg(&wm[w]) < val) {
+                const T* bl = d_block_leaves + (size_t)b * B + w * 32;
+                for (int k = 31; k >= 0; k--)
+                    if (__ldg(&bl[k]) < val) { result = b * B + w * 32 + k; break; }
+            }
+        }
+        d_out[gid] = result;
+    }
+}
+
+// Power-of-two ceiling
+static inline int nextPow2(int x) {
+    int p = 1;
+    while (p < x) p <<= 1;
+    return p;
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+struct WSTLScratch {
+    T*    d_block_leaves    = nullptr;
+    T*    d_block_mins      = nullptr;
+    T*    d_block_warp_mins = nullptr;
+    T*    d_tree            = nullptr;
+    int   num_blocks        = 0;
+    int   M                 = 0;   // next power of two >= num_blocks
+    int   leaf_offset       = 0;   // M - 1
+    int   tree_size         = 0;   // 2*M - 1
+};
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+WSTLScratch<T, BLOCK_SIZE, IPT> allocWSTLScratch(int n) {
+    constexpr int B = BLOCK_SIZE * IPT;
+    constexpr int W = B / 32;
+
+    WSTLScratch<T, BLOCK_SIZE, IPT> s;
+    s.num_blocks  = (n + B - 1) / B;
+    s.M           = nextPow2(s.num_blocks);
+    s.leaf_offset = s.M - 1;
+    s.tree_size   = 2 * s.M - 1;
+
+    gpuAssert(cudaMalloc(&s.d_block_leaves,    (size_t)s.num_blocks * B  * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_block_mins,      (size_t)s.num_blocks      * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_block_warp_mins, (size_t)s.num_blocks * W  * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_tree,            (size_t)s.tree_size        * sizeof(T)));
+    return s;
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void freeWSTLScratch(WSTLScratch<T, BLOCK_SIZE, IPT>& s) {
+    cudaFree(s.d_block_leaves);
+    cudaFree(s.d_block_mins);
+    cudaFree(s.d_block_warp_mins);
+    cudaFree(s.d_tree);
+    s = WSTLScratch<T, BLOCK_SIZE, IPT>{};
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void runWSTL(const T* d_in, int* d_out, int n, WSTLScratch<T, BLOCK_SIZE, IPT>& s) {
+    if (n <= 0) return;
+    constexpr int B = BLOCK_SIZE * IPT;
+
+    // Pass 1: intra-block, no spin-waits
+    wstlPass1Kernel<T, BLOCK_SIZE, IPT>
+        <<<s.num_blocks, BLOCK_SIZE>>>(
+            d_in, d_out, n, s.num_blocks,
+            s.d_block_leaves, s.d_block_mins, s.d_block_warp_mins);
+    gpuAssert(cudaGetLastError());
+
+    // Pass 2: build block-level segment min-tree bottom-up
+    {
+        int tpb = 256;
+        int blocks = (s.M + tpb - 1) / tpb;
+        wstlFillLeavesKernel<T><<<blocks, tpb>>>(
+            s.d_block_mins, s.d_tree, s.num_blocks, s.leaf_offset, s.M);
+        gpuAssert(cudaGetLastError());
+
+        // Reduce level by level bottom-up
+        int level_size = s.M / 2;
+        int level_start = s.leaf_offset / 2;  // parent of first leaf = (M-1-1)/2 = (M-2)/2
+        // Actually: parent of leaf[0] = (leaf_offset - 1)/2
+        // Bottom level of internal nodes: children are s.leaf_offset..s.leaf_offset+s.M-1
+        // Parent of leaf_offset+i is (leaf_offset+i-1)/2
+        // Level start of parent level = (leaf_offset - 1) / 2  ... not exactly
+        // Simpler: iterate from the bottom of the internal nodes
+        // The internal nodes are [0, leaf_offset-1] = [0, M-2]
+        // Bottom level: nodes [M/2-1 .. M-2], count = M/2
+        level_start = s.M / 2 - 1;
+        level_size  = s.M / 2;
+        while (level_size > 0) {
+            int b2 = (level_size + tpb - 1) / tpb;
+            wstlReduceLevelKernel<T><<<b2, tpb>>>(s.d_tree, level_start, level_size);
+            gpuAssert(cudaGetLastError());
+            level_size  >>= 1;
+            level_start  = (level_start - 1) / 2;
+        }
+    }
+
+    // Pass 3: tree query + leaf scan for elements needing inter-block lookup
+    wstlPass3Kernel<T, BLOCK_SIZE, IPT>
+        <<<s.num_blocks, BLOCK_SIZE>>>(
+            d_in, d_out, n, s.num_blocks,
+            s.d_block_leaves, s.d_block_mins, s.d_block_warp_mins,
+            s.d_tree, s.leaf_offset);
+    gpuAssert(cudaGetLastError());
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void launchWSTL(const T* d_in, int* d_out, int n) {
+    if (n <= 0) return;
+    auto s = allocWSTLScratch<T, BLOCK_SIZE, IPT>(n);
+    runWSTL<T, BLOCK_SIZE, IPT>(d_in, d_out, n, s);
+    gpuAssert(cudaDeviceSynchronize());
+    freeWSTLScratch<T, BLOCK_SIZE, IPT>(s);
+}
+
+// ===========================================================================
+// SinglePassTree (SPT) — cooperative single-pass kernel
+//
+// Uses CUDA cooperative launch (grid.sync()) to implement the WSTL pipeline
+// in a single kernel invocation with persistent thread-blocks:
+//
+//   Phase 1: each physical block processes its assigned logical blocks
+//            sequentially (stride = num_physical_blocks).  Computes intra-block
+//            PSE, publishes block_min[b], warp-mins, leaves.
+//   grid.sync()
+//   Phase 2: build segment min-tree over block_mins bottom-up, one level per
+//            grid.sync().  Physical blocks share the work at each level.
+//   grid.sync() (after final tree level)
+//   Phase 3: each physical block processes its logical blocks, querying the
+//            tree (ascent+descent O(log num_blocks)) for elements with
+//            d_out==INT_MIN, then scans the found block's warp-mins + 32 leaves.
+//
+// Constraint: grid must fit on-chip for grid.sync() → launch exactly
+//   cudaOccupancyMaxActiveBlocksPerMultiprocessor × num_SMs physical blocks.
+//   Each physical block loops over ~num_blocks / num_physical_blocks logical
+//   blocks.  No spin-waits anywhere after the grid.sync().
+// ===========================================================================
+
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+
+template <typename T, int BLOCK_SIZE, int IPT>
+__global__
+void apsepKernelSPT(
+        const T* __restrict__   d_in,
+        int*                    d_out,
+        int                     n,
+        int                     num_blocks,
+        int                     M,            // next pow2 >= num_blocks
+        int                     leaf_offset,  // M - 1
+        T* __restrict__         d_block_leaves,
+        T* __restrict__         d_block_mins,
+        T* __restrict__         d_block_warp_mins,
+        T* __restrict__         d_tree,       // 2*M-1 nodes
+        T* __restrict__         d_prefix_min) // prefix_min[b] = min(block_min[0..b-1]), INF for b=0
+{
+    cg::grid_group grid = cg::this_grid();
+
+    constexpr int B         = BLOCK_SIZE * IPT;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    constexpr int W         = B / 32;
+    const     T   INF       = ApsepInfinity<T>::value();
+
+    const int phys_bid   = (int)blockIdx.x;
+    const int num_phys   = (int)gridDim.x;
+    const int lane       = threadIdx.x & 31;
+    const int warp_id    = threadIdx.x >> 5;
+
+    __shared__ T s_elems[B];
+    __shared__ T s_stripe_min[IPT][NUM_WARPS];
+
+    // -------------------------------------------------------------------------
+    // Phase 1: each physical block processes its logical blocks
+    // -------------------------------------------------------------------------
+    for (int block_id = phys_bid; block_id < num_blocks; block_id += num_phys) {
+        const int glb_offs = block_id * B;
+
+        #pragma unroll
+        for (int i = 0; i < IPT; i++) {
+            int lid = i * BLOCK_SIZE + threadIdx.x;
+            int gid = glb_offs + lid;
+            s_elems[lid] = (gid < n) ? d_in[gid] : INF;
+        }
+        __syncthreads();
+
+        T left_carry[IPT];
+        #pragma unroll
+        for (int ipt = 0; ipt < IPT; ipt++) {
+            T c = s_elems[ipt * BLOCK_SIZE + threadIdx.x];
+            #pragma unroll
+            for (int step = 1; step <= 16; step <<= 1) {
+                T nb = __shfl_up_sync(0xffffffff, c, step);
+                if (lane >= step) c = min(c, nb);
+            }
+            left_carry[ipt] = __shfl_up_sync(0xffffffff, c, 1);
+            T wm = __shfl_sync(0xffffffff, c, 31);
+            if (lane == 0) s_stripe_min[ipt][warp_id] = wm;
+        }
+        __syncthreads();
+
+        // Intra-block PSE
+        #pragma unroll
+        for (int ipt = 0; ipt < IPT; ipt++) {
+            int lid = ipt * BLOCK_SIZE + threadIdx.x;
+            int gid = glb_offs + lid;
+            if (gid >= n) continue;
+            T val = s_elems[lid];
+            int result = -1;
+
+            if (lane > 0 && left_carry[ipt] < val) {
+                int base = ipt * BLOCK_SIZE + warp_id * 32;
+                for (int k = lane - 1; k >= 0; k--)
+                    if (s_elems[base + k] < val) { result = base + k; break; }
+            }
+            if (result < 0) {
+                for (int w = warp_id - 1; w >= 0 && result < 0; w--) {
+                    if (s_stripe_min[ipt][w] < val) {
+                        int wb = ipt * BLOCK_SIZE + w * 32;
+                        for (int k = 31; k >= 0; k--)
+                            if (s_elems[wb + k] < val) { result = wb + k; break; }
+                    }
+                }
+            }
+            if (result < 0) {
+                for (int i = ipt - 1; i >= 0 && result < 0; i--) {
+                    for (int w = NUM_WARPS - 1; w >= 0 && result < 0; w--) {
+                        if (s_stripe_min[i][w] < val) {
+                            int wb = i * BLOCK_SIZE + w * 32;
+                            for (int k = 31; k >= 0; k--)
+                                if (s_elems[wb + k] < val) { result = wb + k; break; }
+                        }
+                    }
+                }
+            }
+            d_out[gid] = (result >= 0) ? (glb_offs + result) : INT_MIN;
+        }
+
+        // Publish leaves, warp-mins, block_min
+        T* g_leaves = d_block_leaves + (size_t)block_id * B;
+        for (int i = threadIdx.x; i < B; i += BLOCK_SIZE)
+            g_leaves[i] = s_elems[i];
+
+        if (lane == 0) {
+            T* g_wm = d_block_warp_mins + (size_t)block_id * W;
+            for (int ipt = 0; ipt < IPT; ipt++)
+                g_wm[ipt * NUM_WARPS + warp_id] = s_stripe_min[ipt][warp_id];
+        }
+
+        // Reduce block_min using first warp across all IPT*NUM_WARPS stripe mins (W values)
+        if (warp_id == 0) {
+            T bmin = (lane < W) ? s_stripe_min[lane / NUM_WARPS][lane % NUM_WARPS] : INF;
+            #pragma unroll
+            for (int step = 16; step >= 1; step >>= 1)
+                bmin = min(bmin, __shfl_xor_sync(0xffffffff, bmin, step));
+            if (lane == 0) d_block_mins[block_id] = bmin;
+        }
+
+        __syncthreads();  // ensure all writes committed before grid.sync
+    }
+
+    // -------------------------------------------------------------------------
+    // grid.sync(): all block_mins are now populated
+    // -------------------------------------------------------------------------
+    grid.sync();
+
+    // -------------------------------------------------------------------------
+    // Phase 2: build segment min-tree bottom-up
+    // Fill leaves: d_tree[leaf_offset + i] = (i < num_blocks) ? block_mins[i] : INF
+    // -------------------------------------------------------------------------
+    for (int i = phys_bid * BLOCK_SIZE + threadIdx.x; i < M; i += num_phys * BLOCK_SIZE)
+        d_tree[leaf_offset + i] = (i < num_blocks) ? d_block_mins[i] : INF;
+
+    // Reduce level by level
+    {
+        int level_size  = M / 2;
+        int level_start = M / 2 - 1;
+        while (level_size > 0) {
+            grid.sync();
+            for (int i = phys_bid * BLOCK_SIZE + threadIdx.x;
+                 i < level_size;
+                 i += num_phys * BLOCK_SIZE) {
+                int node = level_start + i;
+                d_tree[node] = min(d_tree[2 * node + 1], d_tree[2 * node + 2]);
+            }
+            level_size  >>= 1;
+            level_start  = (level_start - 1) / 2;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // grid.sync(): tree is fully built
+    // -------------------------------------------------------------------------
+    grid.sync();
+
+    // Parallel prefix-min scan: use Hillis-Steele upsweep into d_prefix_min.
+    // d_prefix_min[b] = min(block_min[0..b-1]) (exclusive prefix min).
+    // Pass 0: copy block_mins into d_prefix_min (shift right by 1, pad INF at [0]).
+    {
+        const T INF2 = ApsepInfinity<T>::value();
+        for (int i = phys_bid * BLOCK_SIZE + threadIdx.x; i < num_blocks; i += num_phys * BLOCK_SIZE)
+            d_prefix_min[i] = (i > 0) ? d_block_mins[i - 1] : INF2;
+    }
+    // Hillis-Steele prefix-min scan: log2(num_blocks) passes.
+    for (int stride = 1; stride < num_blocks; stride <<= 1) {
+        grid.sync();
+        for (int i = phys_bid * BLOCK_SIZE + threadIdx.x; i < num_blocks; i += num_phys * BLOCK_SIZE) {
+            if (i >= stride)
+                d_prefix_min[i] = min(d_prefix_min[i], d_prefix_min[i - stride]);
+        }
+    }
+    grid.sync();
+
+    // -------------------------------------------------------------------------
+    // Phase 3: tree query + leaf scan for elements with d_out == INT_MIN
+    // -------------------------------------------------------------------------
+
+    for (int block_id = phys_bid; block_id < num_blocks; block_id += num_phys) {
+        const int glb_offs = block_id * B;
+        const T prefix_min_b = d_prefix_min[block_id];  // min(block_min[0..block_id-1])
+
+        for (int i = threadIdx.x; i < B; i += BLOCK_SIZE) {
+            int gid = glb_offs + i;
+            if (gid >= n) continue;
+            if (d_out[gid] != INT_MIN) continue;
+
+            T val = d_in[gid];
+
+            // O(1) early exit: if min of all preceding block_mins >= val, answer is -1
+            if (prefix_min_b >= val) { d_out[gid] = -1; continue; }
+
+            // Ascent+descent on block-level tree
+            int node = leaf_offset + block_id;
+            int found_block = -1;
+            while (node > 0) {
+                bool is_right = (node % 2 == 0);
+                if (is_right) {
+                    int left_sib = node - 1;
+                    if (__ldg(&d_tree[left_sib]) < val) {
+                        node = left_sib;
+                        while (node < leaf_offset) {
+                            int rc = 2 * node + 2;
+                            node = (__ldg(&d_tree[rc]) < val) ? rc : (2 * node + 1);
+                        }
+                        found_block = node - leaf_offset;
+                        break;
+                    }
+                }
+                node = (node - 1) / 2;
+            }
+
+            if (found_block < 0) { d_out[gid] = -1; continue; }
+
+            // Scan warp-mins then 32 leaves in found_block
+            const T* wm = d_block_warp_mins + (size_t)found_block * W;
+            int result = -1;
+            for (int w = W - 1; w >= 0 && result < 0; w--) {
+                if (__ldg(&wm[w]) < val) {
+                    const T* bl = d_block_leaves + (size_t)found_block * B + w * 32;
+                    for (int k = 31; k >= 0; k--)
+                        if (__ldg(&bl[k]) < val) { result = found_block * B + w * 32 + k; break; }
+                }
+            }
+            d_out[gid] = result;
+        }
+    }
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+struct SPTScratch {
+    T*    d_block_leaves    = nullptr;
+    T*    d_block_mins      = nullptr;
+    T*    d_block_warp_mins = nullptr;
+    T*    d_tree            = nullptr;
+    T*    d_prefix_min      = nullptr;  // prefix_min[b] = min(block_min[0..b-1])
+    int   num_blocks        = 0;
+    int   M                 = 0;
+    int   leaf_offset       = 0;
+    int   num_phys          = 0;
+};
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+SPTScratch<T, BLOCK_SIZE, IPT> allocSPTScratch(int n) {
+    constexpr int B = BLOCK_SIZE * IPT;
+    constexpr int W = B / 32;
+
+    SPTScratch<T, BLOCK_SIZE, IPT> s;
+    s.num_blocks  = (n + B - 1) / B;
+    s.M           = nextPow2(s.num_blocks);
+    s.leaf_offset = s.M - 1;
+
+    // Determine physical block count: occupancy × SM count
+    int blocks_per_sm = 0;
+    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm,
+        apsepKernelSPT<T, BLOCK_SIZE, IPT>,
+        BLOCK_SIZE, 0));
+    cudaDeviceProp prop;
+    gpuAssert(cudaGetDeviceProperties(&prop, 0));
+    s.num_phys = blocks_per_sm * prop.multiProcessorCount;
+
+    gpuAssert(cudaMalloc(&s.d_block_leaves,    (size_t)s.num_blocks * B  * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_block_mins,      (size_t)s.num_blocks      * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_block_warp_mins, (size_t)s.num_blocks * W  * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_tree,            (size_t)(2 * s.M - 1)     * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_prefix_min,      (size_t)s.num_blocks      * sizeof(T)));
+    return s;
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void freeSPTScratch(SPTScratch<T, BLOCK_SIZE, IPT>& s) {
+    cudaFree(s.d_block_leaves);
+    cudaFree(s.d_block_mins);
+    cudaFree(s.d_block_warp_mins);
+    cudaFree(s.d_tree);
+    cudaFree(s.d_prefix_min);
+    s = SPTScratch<T, BLOCK_SIZE, IPT>{};
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void runSPT(const T* d_in, int* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s) {
+    if (n <= 0) return;
+
+    void* args[] = {
+        (void*)&d_in, (void*)&d_out, (void*)&n,
+        (void*)&s.num_blocks, (void*)&s.M, (void*)&s.leaf_offset,
+        (void*)&s.d_block_leaves, (void*)&s.d_block_mins,
+        (void*)&s.d_block_warp_mins, (void*)&s.d_tree,
+        (void*)&s.d_prefix_min
+    };
+    gpuAssert(cudaLaunchCooperativeKernel(
+        (void*)apsepKernelSPT<T, BLOCK_SIZE, IPT>,
+        s.num_phys, BLOCK_SIZE, args, 0, nullptr));
+    gpuAssert(cudaGetLastError());
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void launchSPT(const T* d_in, int* d_out, int n) {
+    if (n <= 0) return;
+    auto s = allocSPTScratch<T, BLOCK_SIZE, IPT>(n);
+    runSPT<T, BLOCK_SIZE, IPT>(d_in, d_out, n, s);
+    gpuAssert(cudaDeviceSynchronize());
+    freeSPTScratch<T, BLOCK_SIZE, IPT>(s);
+}
+
+// ===========================================================================
+// SPT-Atomic: cooperative single-pass kernel using atomicMin tree construction
+//
+// Same as SPT but Phase 2 (bottom-up grid.sync tree build) is replaced with
+// inline atomicMin updates during Phase 1:
+//   After computing bmin for a logical block, thread 0 walks from
+//   d_tree[leaf_offset + block_id] up to root, doing atomicMin on each ancestor.
+//
+// This eliminates ~16 grid.sync() calls for tree construction, at the cost of
+// ~log2(M) = 16 atomicMin operations per logical block.
+//
+// Requires T to be an unsigned integer type (atomicMin on unsigned int).
+// Tree is initialized to INF (all-bits-set) before Phase 1 via cooperative init.
+// ===========================================================================
+
+template <typename T, int BLOCK_SIZE, int IPT>
+__global__
+void apsepKernelSPTAtomic(
+        const T* __restrict__   d_in,
+        int*                    d_out,
+        int                     n,
+        int                     num_blocks,
+        int                     M,
+        int                     leaf_offset,
+        T* __restrict__         d_block_leaves,
+        T* __restrict__         d_block_mins,
+        T* __restrict__         d_block_warp_mins,
+        T* __restrict__         d_tree) {
+
+    cg::grid_group grid = cg::this_grid();
+
+    constexpr int B         = BLOCK_SIZE * IPT;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    constexpr int W         = B / 32;
+    const     T   INF       = ApsepInfinity<T>::value();
+
+    const int phys_bid = (int)blockIdx.x;
+    const int num_phys = (int)gridDim.x;
+    const int lane     = threadIdx.x & 31;
+    const int warp_id  = threadIdx.x >> 5;
+
+    __shared__ T s_elems[B];
+    __shared__ T s_stripe_min[IPT][NUM_WARPS];
+
+    // Initialize tree to INF cooperatively before Phase 1
+    const int tree_size = 2 * M - 1;
+    for (int i = phys_bid * BLOCK_SIZE + threadIdx.x; i < tree_size; i += num_phys * BLOCK_SIZE)
+        d_tree[i] = INF;
+    grid.sync();
+
+    // -------------------------------------------------------------------------
+    // Phase 1: intra-block PSE + atomicMin tree construction
+    // -------------------------------------------------------------------------
+    for (int block_id = phys_bid; block_id < num_blocks; block_id += num_phys) {
+        const int glb_offs = block_id * B;
+
+        #pragma unroll
+        for (int i = 0; i < IPT; i++) {
+            int lid = i * BLOCK_SIZE + threadIdx.x;
+            int gid = glb_offs + lid;
+            s_elems[lid] = (gid < n) ? d_in[gid] : INF;
+        }
+        __syncthreads();
+
+        T left_carry[IPT];
+        #pragma unroll
+        for (int ipt = 0; ipt < IPT; ipt++) {
+            T c = s_elems[ipt * BLOCK_SIZE + threadIdx.x];
+            #pragma unroll
+            for (int step = 1; step <= 16; step <<= 1) {
+                T nb = __shfl_up_sync(0xffffffff, c, step);
+                if (lane >= step) c = min(c, nb);
+            }
+            left_carry[ipt] = __shfl_up_sync(0xffffffff, c, 1);
+            T wm = __shfl_sync(0xffffffff, c, 31);
+            if (lane == 0) s_stripe_min[ipt][warp_id] = wm;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int ipt = 0; ipt < IPT; ipt++) {
+            int lid = ipt * BLOCK_SIZE + threadIdx.x;
+            int gid = glb_offs + lid;
+            if (gid >= n) continue;
+            T val = s_elems[lid];
+            int result = -1;
+            if (lane > 0 && left_carry[ipt] < val) {
+                int base = ipt * BLOCK_SIZE + warp_id * 32;
+                for (int k = lane - 1; k >= 0; k--)
+                    if (s_elems[base + k] < val) { result = base + k; break; }
+            }
+            if (result < 0) {
+                for (int w = warp_id - 1; w >= 0 && result < 0; w--) {
+                    if (s_stripe_min[ipt][w] < val) {
+                        int wb = ipt * BLOCK_SIZE + w * 32;
+                        for (int k = 31; k >= 0; k--)
+                            if (s_elems[wb + k] < val) { result = wb + k; break; }
+                    }
+                }
+            }
+            if (result < 0) {
+                for (int i = ipt - 1; i >= 0 && result < 0; i--) {
+                    for (int w = NUM_WARPS - 1; w >= 0 && result < 0; w--) {
+                        if (s_stripe_min[i][w] < val) {
+                            int wb = i * BLOCK_SIZE + w * 32;
+                            for (int k = 31; k >= 0; k--)
+                                if (s_elems[wb + k] < val) { result = wb + k; break; }
+                        }
+                    }
+                }
+            }
+            d_out[gid] = (result >= 0) ? (glb_offs + result) : INT_MIN;
+        }
+
+        // Publish leaves and warp-mins
+        T* g_leaves = d_block_leaves + (size_t)block_id * B;
+        for (int i = threadIdx.x; i < B; i += BLOCK_SIZE)
+            g_leaves[i] = s_elems[i];
+        if (lane == 0) {
+            T* g_wm = d_block_warp_mins + (size_t)block_id * W;
+            for (int ipt = 0; ipt < IPT; ipt++)
+                g_wm[ipt * NUM_WARPS + warp_id] = s_stripe_min[ipt][warp_id];
+        }
+
+        // Compute block_min and atomicMin up the tree (warp 0, thread 0)
+        if (warp_id == 0) {
+            T bmin = (lane < W) ? s_stripe_min[lane / NUM_WARPS][lane % NUM_WARPS] : INF;
+            #pragma unroll
+            for (int step = 16; step >= 1; step >>= 1)
+                bmin = min(bmin, __shfl_xor_sync(0xffffffff, bmin, step));
+            if (lane == 0) {
+                d_block_mins[block_id] = bmin;
+                // Walk up the tree from this block's leaf, atomicMin at each node
+                int node = leaf_offset + block_id;
+                while (node >= 0) {
+                    atomicMin(&d_tree[node], bmin);
+                    if (node == 0) break;
+                    node = (node - 1) / 2;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // One grid.sync: all block_mins and tree updates complete
+    grid.sync();
+
+    // -------------------------------------------------------------------------
+    // Phase 3: tree query + leaf scan (same as SPT, no Phase 2 needed)
+    // -------------------------------------------------------------------------
+    for (int block_id = phys_bid; block_id < num_blocks; block_id += num_phys) {
+        const int glb_offs = block_id * B;
+
+        for (int i = threadIdx.x; i < B; i += BLOCK_SIZE) {
+            int gid = glb_offs + i;
+            if (gid >= n) continue;
+            if (d_out[gid] != INT_MIN) continue;
+
+            T val = d_in[gid];
+
+            int node = leaf_offset + block_id;
+            int found_block = -1;
+            while (node > 0) {
+                bool is_right = (node % 2 == 0);
+                if (is_right) {
+                    int left_sib = node - 1;
+                    if (__ldg(&d_tree[left_sib]) < val) {
+                        node = left_sib;
+                        while (node < leaf_offset) {
+                            int rc = 2 * node + 2;
+                            node = (__ldg(&d_tree[rc]) < val) ? rc : (2 * node + 1);
+                        }
+                        found_block = node - leaf_offset;
+                        break;
+                    }
+                }
+                node = (node - 1) / 2;
+            }
+
+            if (found_block < 0) { d_out[gid] = -1; continue; }
+
+            const T* wm = d_block_warp_mins + (size_t)found_block * W;
+            int result = -1;
+            for (int w = W - 1; w >= 0 && result < 0; w--) {
+                if (__ldg(&wm[w]) < val) {
+                    const T* bl = d_block_leaves + (size_t)found_block * B + w * 32;
+                    for (int k = 31; k >= 0; k--)
+                        if (__ldg(&bl[k]) < val) { result = found_block * B + w * 32 + k; break; }
+                }
+            }
+            d_out[gid] = result;
+        }
+    }
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void runSPTAtomic(const T* d_in, int* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s) {
+    if (n <= 0) return;
+    // SPTAtomic uses same scratch as SPT; reuse allocSPTScratch
+    // but num_phys must be queried for apsepKernelSPTAtomic
+    int blocks_per_sm = 0;
+    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, apsepKernelSPTAtomic<T, BLOCK_SIZE, IPT>, BLOCK_SIZE, 0));
+    cudaDeviceProp prop;
+    gpuAssert(cudaGetDeviceProperties(&prop, 0));
+    int num_phys = blocks_per_sm * prop.multiProcessorCount;
+
+    void* args[] = {
+        (void*)&d_in, (void*)&d_out, (void*)&n,
+        (void*)&s.num_blocks, (void*)&s.M, (void*)&s.leaf_offset,
+        (void*)&s.d_block_leaves, (void*)&s.d_block_mins,
+        (void*)&s.d_block_warp_mins, (void*)&s.d_tree
+    };
+    gpuAssert(cudaLaunchCooperativeKernel(
+        (void*)apsepKernelSPTAtomic<T, BLOCK_SIZE, IPT>,
+        num_phys, BLOCK_SIZE, args, 0, nullptr));
+    gpuAssert(cudaGetLastError());
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void launchSPTAtomic(const T* d_in, int* d_out, int n) {
+    if (n <= 0) return;
+    auto s = allocSPTScratch<T, BLOCK_SIZE, IPT>(n);
+    runSPTAtomic<T, BLOCK_SIZE, IPT>(d_in, d_out, n, s);
+    gpuAssert(cudaDeviceSynchronize());
+    freeSPTScratch<T, BLOCK_SIZE, IPT>(s);
+}
+
+// ===========================================================================
 // Approach A: Two-level superblock hierarchy (WarpScanNoTree2L)
 //
 // Adds a "super-superblock" (SSB) level grouping G superblocks.
@@ -3295,4 +4487,282 @@ void launchNoBlockTree(const T* d_in, int* d_out, int n) {
     runNoBlockTree<T, BLOCK_SIZE, IPT, K>(d_in, d_out, n, s);
     gpuAssert(cudaDeviceSynchronize());
     freeNoBlockTreeScratch<T, BLOCK_SIZE, IPT, K>(s);
+}
+
+// ===========================================================================
+// BSZ Two-Stage APSEP
+//
+// Implements the BSZ algorithm (Sitchinava & Svenning, SPAA '24) adapted for
+// GPU:
+//
+//   Stage 1 (bszStage1Kernel): Each CTA processes one tile of B=BS*IPT
+//   elements.  A sequential monotone-stack scan finds *local* matches (j in
+//   the same tile).  Non-local elements are marked with sentinel INT_MIN in
+//   d_out.  The tile minimum value and its global index are stored in
+//   d_tile_min_vals / d_tile_min_idxs.
+//
+//   Stage 2 (bszBuildTreeKernel): A global segment-min tree of depth
+//   ceil(log2(n)) is built over d_in.  Each internal node stores the minimum
+//   of its subtree, enabling O(log n) "rightmost element < threshold in prefix
+//   [0, i-1]" queries.  The tree has M = next_pow2(n) leaves stored at
+//   positions [M .. 2M-1] in a 1-indexed array.
+//
+//   Stage 3 (bszNonlocalKernel): Each non-local element (d_out[i] == INT_MIN)
+//   independently queries the global segment-min tree to find the rightmost
+//   j < i with d_in[j] < d_in[i] in O(log n) steps.  This is fully parallel
+//   with no inter-thread dependency.
+//
+// Key insight (Observation 1 / Lemma 3 of the paper): the non-local unmatched
+// values partition remaining elements into *disjoint independent* subproblems,
+// so all queries can run concurrently.  This breaks the serial dependency chain
+// of the decoupled look-back approach.
+//
+// Template parameters:
+//   T         – element type
+//   BLOCK_SIZE – threads per CTA for stage-1
+//   IPT       – items per thread  (B = BLOCK_SIZE * IPT)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Stage 1: local matches via sequential monotone-stack scan
+// ---------------------------------------------------------------------------
+
+template <typename T, int BLOCK_SIZE, int IPT>
+__global__ void bszStage1Kernel(
+        const T* __restrict__ d_in,
+        int*                  d_out,
+        int                   n,
+        T*  __restrict__      d_tile_min_vals,
+        int*                  d_tile_min_idxs)
+{
+    constexpr int B = BLOCK_SIZE * IPT;
+    const int tile  = blockIdx.x;
+    const int base  = tile * B;
+
+    // Shared memory: elements + a monotone stack (indices only)
+    __shared__ T   s_elems[B];
+    __shared__ int s_stack[B];   // monotone-stack index buffer
+
+    // Load tile into shared memory
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) {
+        int lid = i * BLOCK_SIZE + threadIdx.x;
+        int gid = base + lid;
+        s_elems[lid] = (gid < n) ? d_in[gid] : ApsepInfinity<T>::value();
+    }
+    __syncthreads();
+
+    // Thread 0 runs the sequential SEQ algorithm (monotone stack) to find
+    // local matches and the tile minimum.
+    if (threadIdx.x == 0) {
+        int depth  = 0;
+        T   tmin   = ApsepInfinity<T>::value();
+        int tmin_i = base;
+
+        for (int lid = 0; lid < B; lid++) {
+            int gid = base + lid;
+            if (gid >= n) break;
+            T val = s_elems[lid];
+
+            // pop stack while top >= val
+            while (depth > 0 && s_elems[s_stack[depth - 1]] >= val)
+                depth--;
+
+            // local match = stack top (must be in same tile)
+            int match = (depth > 0) ? (base + s_stack[depth - 1]) : INT_MIN;
+            // INT_MIN is the "needs non-local look-up" sentinel (never a valid index)
+            d_out[gid] = match;
+
+            s_stack[depth++] = lid;
+
+            if (val < tmin) { tmin = val; tmin_i = gid; }
+        }
+
+        d_tile_min_vals[tile] = tmin;
+        d_tile_min_idxs[tile] = tmin_i;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: build global min-tree in Futhark transparent_reduction_tree layout.
+//
+// 0-indexed, root at 0, left child of i = 2i+1, right child = 2i+2.
+// Leaf offset = M-1 where M = next_pow2(n).  Total tree size = 2M-1.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void bszFillLeavesKernel(
+        const T* __restrict__ d_in,
+        T*       __restrict__ d_tree,
+        int n,
+        int leaf_offset,
+        int M)
+{
+    const T INF = ApsepInfinity<T>::value();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < M; i += gridDim.x * blockDim.x)
+        d_tree[leaf_offset + i] = (i < n) ? d_in[i] : INF;
+}
+
+// Reduce one level: nodes [level_start .. level_start+count-1]
+template <typename T>
+__global__ void bszReduceLevelKernel(
+        T* __restrict__ d_tree,
+        int level_start,
+        int count)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
+        int node = level_start + i;
+        d_tree[node] = min(d_tree[2 * node + 1], d_tree[2 * node + 2]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: ascent + descent query (Futhark transparent_reduction_tree.previous)
+//
+// For each i where d_out[i] == INT_MIN:
+//   find rightmost j < i with d_in[j] < d_in[i]
+//
+// Ascent from leaf(i): climb while we are either a right child OR the left
+//   sibling subtree has no value < val.
+// Descent into left sibling: prefer right child whenever it satisfies < val.
+//
+// Visits exactly O(log n) tree nodes — two root-to-leaf paths.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__device__ int bszTreeQuery(
+        const T* __restrict__ d_tree,
+        int leaf_offset,
+        int i,
+        T   val)
+{
+    int node = leaf_offset + i;
+
+    while (node != 0) {
+        bool is_right_child = (node % 2 == 0);
+        if (is_right_child) {
+            int left_sib = node - 1;
+            if (d_tree[left_sib] < val) {
+                // descend left sibling, always preferring right child
+                node = left_sib;
+                while (node < leaf_offset) {
+                    int rc = 2 * node + 2;
+                    int lc = 2 * node + 1;
+                    node = (d_tree[rc] < val) ? rc : lc;
+                }
+                return node - leaf_offset;
+            }
+        }
+        node = (node - 1) / 2;
+    }
+    return -1;
+}
+
+template <typename T>
+__global__ void bszNonlocalKernel(
+        const T* __restrict__ d_in,
+        int*                  d_out,
+        int                   n,
+        const T* __restrict__ d_tree,
+        int                   leaf_offset)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n) return;
+    if (d_out[gid] != INT_MIN) return;
+
+    T val = d_in[gid];
+    d_out[gid] = bszTreeQuery<T>(d_tree, leaf_offset, gid, val);
+}
+
+// ---------------------------------------------------------------------------
+// Scratch + wrappers
+// ---------------------------------------------------------------------------
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+struct ApsepBSZScratch {
+    T*   d_tree          = nullptr;
+    T*   d_tile_min_vals = nullptr;
+    int* d_tile_min_idxs = nullptr;
+    int  num_tiles       = 0;
+    int  M               = 0;   // next_pow2(n)
+    int  leaf_offset     = 0;   // M - 1  (index of first leaf in 0-indexed tree)
+};
+
+static inline int bszNextPow2(int n) {
+    int m = 1;
+    while (m < n) m <<= 1;
+    return m;
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+ApsepBSZScratch<T, BLOCK_SIZE, IPT> allocBSZScratch(int n) {
+    constexpr int B = BLOCK_SIZE * IPT;
+    ApsepBSZScratch<T, BLOCK_SIZE, IPT> s;
+    s.num_tiles   = (n + B - 1) / B;
+    s.M           = bszNextPow2(n);
+    s.leaf_offset = s.M - 1;
+
+    // Tree has 2M-1 nodes (0-indexed, root=0, leaves=[M-1..2M-2])
+    gpuAssert(cudaMalloc(&s.d_tree,          (size_t)(2 * s.M - 1) * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_tile_min_vals, (size_t)s.num_tiles * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_tile_min_idxs, (size_t)s.num_tiles * sizeof(int)));
+    return s;
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void freeBSZScratch(ApsepBSZScratch<T, BLOCK_SIZE, IPT>& s) {
+    cudaFree(s.d_tree);
+    cudaFree(s.d_tile_min_vals);
+    cudaFree(s.d_tile_min_idxs);
+    s = ApsepBSZScratch<T, BLOCK_SIZE, IPT>{};
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void runBSZ(const T* d_in, int* d_out, int n,
+            ApsepBSZScratch<T, BLOCK_SIZE, IPT>& s) {
+    constexpr int B = BLOCK_SIZE * IPT;
+    const int M     = s.M;
+
+    // --- Stage 1: local matches (sequential SEQ per tile) ---
+    bszStage1Kernel<T, BLOCK_SIZE, IPT>
+        <<<s.num_tiles, BLOCK_SIZE>>>(
+            d_in, d_out, n, s.d_tile_min_vals, s.d_tile_min_idxs);
+    gpuAssert(cudaGetLastError());
+    gpuAssert(cudaDeviceSynchronize());
+
+    // --- Stage 2: build global min-tree (Futhark layout, 0-indexed) ---
+    {
+        const int leaf_offset = s.leaf_offset;
+        int threads = 256;
+        // Fill leaves
+        int lblocks = (M + threads - 1) / threads;
+        bszFillLeavesKernel<T><<<lblocks, threads>>>(d_in, s.d_tree, n, leaf_offset, M);
+        gpuAssert(cudaGetLastError());
+        gpuAssert(cudaDeviceSynchronize());
+        // Reduce bottom-up: level l has 2^l nodes starting at (2^l - 1)
+        // Go from level h-2 down to 0 (root)
+        for (int count = M >> 1, start = (M >> 1) - 1; count >= 1; count >>= 1, start = (start - 1) / 2) {
+            int rblocks = (count + threads - 1) / threads;
+            bszReduceLevelKernel<T><<<rblocks, threads>>>(s.d_tree, start, count);
+            gpuAssert(cudaGetLastError());
+            gpuAssert(cudaDeviceSynchronize());
+        }
+    }
+
+    // --- Stage 3: non-local matches via ascent+descent tree query ---
+    {
+        int threads = 256;
+        int blocks  = (n + threads - 1) / threads;
+        bszNonlocalKernel<T><<<blocks, threads>>>(d_in, d_out, n, s.d_tree, s.leaf_offset);
+        gpuAssert(cudaGetLastError());
+    }
+}
+
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+void launchBSZ(const T* d_in, int* d_out, int n) {
+    if (n <= 0) return;
+    auto s = allocBSZScratch<T, BLOCK_SIZE, IPT>(n);
+    runBSZ<T, BLOCK_SIZE, IPT>(d_in, d_out, n, s);
+    gpuAssert(cudaDeviceSynchronize());
+    freeBSZScratch<T, BLOCK_SIZE, IPT>(s);
 }
