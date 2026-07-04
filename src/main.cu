@@ -298,9 +298,10 @@ int main() {
     printf("\n=== Benchmark (N=%d, peak=%.0f GB/s) ===\n", N, peak_gbps);
     printf("  useful GB/s = 2*N*4 / time.  logical MB = all array accesses (tree reads\n");
     printf("  may be L2-cached and not consume full DRAM bandwidth).\n");
-    printf("  %-11s  %-29s  %-29s\n", "",
-           "---------- WSTL ----------",
-           "---------- SPT  ----------");
+    // Each half spans: 11 + 2 + 9 + 2 + 6 = 30 chars
+    printf("  %-11s  %-30s  %-30s\n", "",
+           "------------ WSTL ------------",
+           "------------ SPT  ------------");
     printf("  %-11s  %11s  %9s  %6s  %11s  %9s  %6s\n",
            "input", "useful", "logical", "%peak", "useful", "logical", "%peak");
     printf("  %-11s  %11s  %9s  %6s  %11s  %9s  %6s\n",
