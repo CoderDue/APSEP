@@ -41,9 +41,9 @@ static float medianMs(std::vector<float>& ms) {
     return ms[ms.size() / 2];
 }
 
-// Run kernel fn, return median GB/s over iters timed runs (bytes = R+W bytes).
+// Run kernel fn, return median elapsed time in milliseconds.
 template <typename Fn>
-static double benchKernel(Fn fn, long long bytes, int warmup, int iters) {
+static double benchKernelMs(Fn fn, int warmup, int iters) {
     for (int i = 0; i < warmup; i++) { fn(); gpuAssert(cudaDeviceSynchronize()); }
     cudaEvent_t t0, t1;
     gpuAssert(cudaEventCreate(&t0));
@@ -58,8 +58,7 @@ static double benchKernel(Fn fn, long long bytes, int warmup, int iters) {
     }
     gpuAssert(cudaEventDestroy(t0));
     gpuAssert(cudaEventDestroy(t1));
-    float med = medianMs(ms);
-    return (double)bytes / (med * 1e-3) / 1e9;
+    return medianMs(ms);
 }
 
 // Run GPU kernel via launch-fn, compare against CPU reference. Returns true on pass.
@@ -201,72 +200,107 @@ int main() {
     };
 
     // -------------------------------------------------------------------------
-    // Analytical global memory traffic estimates (worst-case descending input)
+    // Analytical logical read/write traffic per input type.
     //
     // "Useful I/O" = 2*N*4 bytes (read input + write output).
-    // All other accesses are overhead from the algorithm structure.
+    // "Logical traffic" counts all array accesses the algorithm issues.
+    // Note: the min-tree (131K nodes, 524 KB) fits in L2 cache, so tree reads
+    // are served from L2 and do NOT consume DRAM bandwidth — logical traffic
+    // for descending WSTL therefore overstates DRAM pressure significantly.
+    // The useful GB/s column (based on 2*N*4) is the standard metric.
     //
-    // WSTL: P3 does a full 16-level tree ascent per element with no match ->
-    //   N*16*4 = 2147 MB of tree reads dominates (10.5x useful I/O total).
-    // SPT:  prefix-min scan enables 100% O(1) early exit on descending input ->
-    //   no tree reads at all, only 2.6x useful I/O total.
+    // Assumptions:
+    //   random:     ~1.3% of elements need inter-block lookup (measured);
+    //               avg tree walk ~16 reads, warp-min+leaf scan ~33 reads.
+    //   descending: 100% need inter-block lookup; WSTL ascends 16 levels with
+    //               no match; SPT prefix-min early exit fires for all (0 tree reads).
+    //   ascending:  0% need inter-block lookup; Phase 3 skips all elements.
     // -------------------------------------------------------------------------
-    {
-        const long long num_blocks_ = (N + B - 1) / B;  // 65536
-        const long long M_          = 65536;             // next pow2 >= num_blocks
-        const long long W_          = B / 32;            // 16 warp-mins per block
-        const long long tree_nodes_ = 2 * M_ - 1;
-        const long long HS_PASSES   = 16;                // log2(num_blocks)
-        const long long TREE_LEVELS = 16;                // log2(M)
+    const long long num_blocks_ = (N + B - 1) / B;  // 65536
+    const long long M_          = 65536;
+    const long long W_          = B / 32;
+    const long long tree_nodes_ = 2 * M_ - 1;
+    const long long HS_PASSES   = 16;  // log2(num_blocks) for Hillis-Steele
+    const long long TREE_LEVELS = 16;  // log2(M) for tree ascent/descent
 
-        auto mb = [](long long b){ return (double)b / 1e6; };
+    // Traffic shared by both kernels: P1 + P2 tree build.
+    const long long common =
+          (long long)N * 4             // P1 read input
+        + (long long)N * 4             // P1 write output
+        + num_blocks_ * B * 4          // P1 write leaves
+        + num_blocks_ * W_ * 4         // P1 write warp-mins
+        + num_blocks_ * 4              // P1 write block-mins
+        + M_ * 4                       // P2 fill tree leaves
+        + (tree_nodes_ - M_) * 2 * 4  // P2 tree reduce read
+        + (tree_nodes_ - M_) * 4;     // P2 tree reduce write
 
-        long long wstl_total =
-            (long long)N * 4              // P1 read input
-          + (long long)N * 4              // P1 write output
-          + num_blocks_ * B * 4           // P1 write leaves
-          + num_blocks_ * W_ * 4          // P1 write warp-mins
-          + num_blocks_ * 4               // P1 write block-mins
-          + M_ * 4                        // P2 fill tree leaves
-          + (tree_nodes_ - M_) * 2 * 4   // P2 tree reduce read (2 children/node)
-          + (tree_nodes_ - M_) * 4        // P2 tree reduce write
-          + (long long)N * 4              // P3 read d_out
-          + (long long)N * 4              // P3 read d_in
-          + (long long)N * TREE_LEVELS * 4; // P3 tree ascent (no match, 16 levels)
+    // SPT adds Hillis-Steele prefix-min scan on top of common.
+    const long long spt_hs = HS_PASSES * num_blocks_ * 4 * 2;  // R+W each pass
 
-        long long spt_total =
-            (long long)N * 4              // P1 read input
-          + (long long)N * 4              // P1 write output
-          + num_blocks_ * B * 4           // P1 write leaves
-          + num_blocks_ * W_ * 4          // P1 write warp-mins
-          + num_blocks_ * 4               // P1 write block-mins
-          + M_ * 4                        // P2 fill tree leaves
-          + (tree_nodes_ - M_) * 2 * 4   // P2 tree reduce read
-          + (tree_nodes_ - M_) * 4        // P2 tree reduce write
-          + HS_PASSES * num_blocks_ * 4   // P2 Hillis-Steele prefix-min read
-          + HS_PASSES * num_blocks_ * 4   // P2 Hillis-Steele prefix-min write
-          + (long long)N * 4              // P3 read d_out
-          + (long long)N * 4              // P3 read d_in
-          + num_blocks_ * 4;              // P3 read d_prefix_min (once per block)
-          // P3 tree reads: 0 (prefix-min early exit fires for 100% of elements)
+    // Per-element inter-block lookup cost (random input):
+    // avg tree walk: ascent to find block (~8 levels) + descent (~8 levels) = 16 reads.
+    // avg warp-min + leaf scan: W=16 warp-min reads + ~17 leaf reads = 33 reads.
+    const long long avg_tree_per_elem    = TREE_LEVELS;  // 16 reads
+    const long long avg_wm_leaf_per_elem = W_ + 17;      // 33 reads
 
-        printf("\n=== Global memory traffic (analytical, worst-case descending N=%d) ===\n", N);
-        printf("  Useful I/O (2*N*4 bytes):   %6.0f MB\n", mb(bytes_rw));
-        printf("  WSTL total traffic:         %6.0f MB  (%.1fx useful I/O)\n",
-               mb(wstl_total), (double)wstl_total / bytes_rw);
-        printf("  SPT  total traffic:         %6.0f MB  (%.1fx useful I/O)\n",
-               mb(spt_total),  (double)spt_total  / bytes_rw);
-        printf("  Note: WSTL P3 tree ascent alone = %.0f MB (N*16*4); "
-               "SPT P3 = 0 MB (prefix-min early exit)\n",
-               mb((long long)N * TREE_LEVELS * 4));
-    }
+    // Per-input analytical traffic (bytes).
+    //
+    // random:     ~1.3% inter-block; WSTL reads d_in only for those;
+    //             SPT reads d_in for ALL (prefix-min check); avg tree walk ~16 reads,
+    //             warp-min+leaf ~33 reads per inter-block element.
+    // descending: 100% inter-block; WSTL ascends 16 levels with no match, no wm/leaf;
+    //             SPT prefix-min fires for all -> 0 tree/wm/leaf reads.
+    // ascending:  0% inter-block; P3 trivially skips all elements (d_out != INT_MIN).
+    const long long n_rand = (long long)(N * 0.013);  // ~1.3% measured
 
-    printf("\n=== Benchmark (N=%d, peak=%.0f GB/s) ===\n",
-           N, (double)prop.memoryClockRate * 1e3 * prop.memoryBusWidth / 8.0 * 2.0 / 1e9);
-    printf("  Throughput reported as useful I/O (2*N*4 bytes) / time.\n");
-    printf("  %-14s  %10s  %10s\n", "input", "WSTL", "SPT");
-    printf("  %-14s  %10s  %10s\n", "-----", "----", "---");
+    struct TrafficRow { const char* label; long long wstl; long long spt; };
+    TrafficRow traffic[] = {
+        {"random",
+            // WSTL random
+            common
+            + (long long)N * 4                                    // P3 read d_out
+            + n_rand * 4                                          // P3 read d_in (inter-block only)
+            + n_rand * (avg_tree_per_elem + avg_wm_leaf_per_elem) * 4,
+            // SPT random
+            common + spt_hs
+            + (long long)N * 4                                    // P3 read d_out
+            + (long long)N * 4                                    // P3 read d_in (all, prefix-min check)
+            + num_blocks_ * 4                                     // P3 read d_prefix_min
+            + n_rand * (avg_tree_per_elem + avg_wm_leaf_per_elem) * 4},
+        {"descending",
+            // WSTL descending: every element ascends 16 levels, no match -> no wm/leaf
+            common
+            + (long long)N * 4                                    // P3 read d_out
+            + (long long)N * 4                                    // P3 read d_in
+            + (long long)N * TREE_LEVELS * 4,                    // P3 tree ascent (no match)
+            // SPT descending: prefix-min fires for all -> 0 tree/wm/leaf
+            common + spt_hs
+            + (long long)N * 4                                    // P3 read d_out
+            + (long long)N * 4                                    // P3 read d_in (prefix-min check)
+            + num_blocks_ * 4},                                   // P3 read d_prefix_min
+        {"ascending",
+            // WSTL ascending: 0% inter-block, P3 reads d_out only (exits immediately)
+            common + (long long)N * 4,
+            // SPT ascending: same but also reads d_in + d_prefix_min for the check
+            common + spt_hs
+            + (long long)N * 4                                    // P3 read d_out
+            + (long long)N * 4                                    // P3 read d_in
+            + num_blocks_ * 4},                                   // P3 read d_prefix_min
+    };
 
+    const double peak_gbps = (double)prop.memoryClockRate * 1e3
+                           * prop.memoryBusWidth / 8.0 * 2.0 / 1e9;
+
+    printf("\n=== Benchmark (N=%d, peak=%.0f GB/s) ===\n", N, peak_gbps);
+    printf("  useful GB/s = 2*N*4 / time.  logical MB = all array accesses (tree reads\n");
+    printf("  may be L2-cached and not consume full DRAM bandwidth).\n");
+    printf("  %-11s  %-32s  %-32s\n", "", "------------ WSTL ------------", "------------ SPT  ------------");
+    printf("  %-11s  %9s  %10s  %6s  %9s  %10s  %6s\n",
+           "input", "useful", "logical MB", "%peak", "useful", "logical MB", "%peak");
+    printf("  %-11s  %9s  %10s  %6s  %9s  %10s  %6s\n",
+           "-----", "------", "----------", "-----", "------", "----------", "-----");
+
+    int ti = 0;
     for (auto& inp : inputs) {
         for (int i = 0; i < N; i++) {
             if      (inp.ascending)  h[i] = i;
@@ -275,9 +309,19 @@ int main() {
         }
         gpuAssert(cudaMemcpy(d_in, h.data(), N * sizeof(int), cudaMemcpyHostToDevice));
 
-        double gbs_wstl = benchKernel(runWSTL_, bytes_rw, 2, 9);
-        double gbs_spt  = benchKernel(runSPT_,  bytes_rw, 2, 9);
-        printf("  %-14s  %8.1f GB/s  %8.1f GB/s\n", inp.label, gbs_wstl, gbs_spt);
+        double ms_wstl = benchKernelMs(runWSTL_, 2, 9);
+        double ms_spt  = benchKernelMs(runSPT_,  2, 9);
+
+        long long tw = traffic[ti].wstl;
+        long long ts = traffic[ti].spt;
+        double useful_w = (double)bytes_rw / (ms_wstl * 1e-3) / 1e9;
+        double useful_s = (double)bytes_rw / (ms_spt  * 1e-3) / 1e9;
+
+        printf("  %-11s  %7.1f GB/s  %7lld MB  %5.1f%%  %7.1f GB/s  %7lld MB  %5.1f%%\n",
+               inp.label,
+               useful_w, tw / 1000000LL, useful_w / peak_gbps * 100.0,
+               useful_s, ts / 1000000LL, useful_s / peak_gbps * 100.0);
+        ti++;
     }
 
     freeWSTLScratch<int,128,4>(wstlScratch);
