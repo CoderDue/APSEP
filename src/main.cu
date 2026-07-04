@@ -179,6 +179,7 @@ int main() {
     // 2. Benchmark
     // -------------------------------------------------------------------------
     const int N = 32 * 1024 * 1024;
+    const int B = 128 * 4;  // BLOCK_SIZE * IPT
     const long long bytes_rw = 2LL * N * sizeof(int);
 
     std::vector<int> h(N);
@@ -199,8 +200,70 @@ int main() {
         {"ascending",  true,  false},
     };
 
+    // -------------------------------------------------------------------------
+    // Analytical global memory traffic estimates (worst-case descending input)
+    //
+    // "Useful I/O" = 2*N*4 bytes (read input + write output).
+    // All other accesses are overhead from the algorithm structure.
+    //
+    // WSTL: P3 does a full 16-level tree ascent per element with no match ->
+    //   N*16*4 = 2147 MB of tree reads dominates (10.5x useful I/O total).
+    // SPT:  prefix-min scan enables 100% O(1) early exit on descending input ->
+    //   no tree reads at all, only 2.6x useful I/O total.
+    // -------------------------------------------------------------------------
+    {
+        const long long num_blocks_ = (N + B - 1) / B;  // 65536
+        const long long M_          = 65536;             // next pow2 >= num_blocks
+        const long long W_          = B / 32;            // 16 warp-mins per block
+        const long long tree_nodes_ = 2 * M_ - 1;
+        const long long HS_PASSES   = 16;                // log2(num_blocks)
+        const long long TREE_LEVELS = 16;                // log2(M)
+
+        auto mb = [](long long b){ return (double)b / 1e6; };
+
+        long long wstl_total =
+            (long long)N * 4              // P1 read input
+          + (long long)N * 4              // P1 write output
+          + num_blocks_ * B * 4           // P1 write leaves
+          + num_blocks_ * W_ * 4          // P1 write warp-mins
+          + num_blocks_ * 4               // P1 write block-mins
+          + M_ * 4                        // P2 fill tree leaves
+          + (tree_nodes_ - M_) * 2 * 4   // P2 tree reduce read (2 children/node)
+          + (tree_nodes_ - M_) * 4        // P2 tree reduce write
+          + (long long)N * 4              // P3 read d_out
+          + (long long)N * 4              // P3 read d_in
+          + (long long)N * TREE_LEVELS * 4; // P3 tree ascent (no match, 16 levels)
+
+        long long spt_total =
+            (long long)N * 4              // P1 read input
+          + (long long)N * 4              // P1 write output
+          + num_blocks_ * B * 4           // P1 write leaves
+          + num_blocks_ * W_ * 4          // P1 write warp-mins
+          + num_blocks_ * 4               // P1 write block-mins
+          + M_ * 4                        // P2 fill tree leaves
+          + (tree_nodes_ - M_) * 2 * 4   // P2 tree reduce read
+          + (tree_nodes_ - M_) * 4        // P2 tree reduce write
+          + HS_PASSES * num_blocks_ * 4   // P2 Hillis-Steele prefix-min read
+          + HS_PASSES * num_blocks_ * 4   // P2 Hillis-Steele prefix-min write
+          + (long long)N * 4              // P3 read d_out
+          + (long long)N * 4              // P3 read d_in
+          + num_blocks_ * 4;              // P3 read d_prefix_min (once per block)
+          // P3 tree reads: 0 (prefix-min early exit fires for 100% of elements)
+
+        printf("\n=== Global memory traffic (analytical, worst-case descending N=%d) ===\n", N);
+        printf("  Useful I/O (2*N*4 bytes):   %6.0f MB\n", mb(bytes_rw));
+        printf("  WSTL total traffic:         %6.0f MB  (%.1fx useful I/O)\n",
+               mb(wstl_total), (double)wstl_total / bytes_rw);
+        printf("  SPT  total traffic:         %6.0f MB  (%.1fx useful I/O)\n",
+               mb(spt_total),  (double)spt_total  / bytes_rw);
+        printf("  Note: WSTL P3 tree ascent alone = %.0f MB (N*16*4); "
+               "SPT P3 = 0 MB (prefix-min early exit)\n",
+               mb((long long)N * TREE_LEVELS * 4));
+    }
+
     printf("\n=== Benchmark (N=%d, peak=%.0f GB/s) ===\n",
            N, (double)prop.memoryClockRate * 1e3 * prop.memoryBusWidth / 8.0 * 2.0 / 1e9);
+    printf("  Throughput reported as useful I/O (2*N*4 bytes) / time.\n");
     printf("  %-14s  %10s  %10s\n", "input", "WSTL", "SPT");
     printf("  %-14s  %10s  %10s\n", "-----", "----", "---");
 
