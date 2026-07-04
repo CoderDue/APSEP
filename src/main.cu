@@ -16,6 +16,86 @@
 #include <numeric>
 
 // ---------------------------------------------------------------------------
+// Table printing helpers
+//
+// A "table" is a sequence of columns. Each column has a header label and a
+// fixed display width. Columns are separated by two spaces. A group of
+// consecutive columns can be spanned by a banner label, which is printed
+// centred (left-padded if shorter, truncated if longer) over exactly the
+// combined width of the columns it spans, including the inter-column gaps.
+// ---------------------------------------------------------------------------
+
+struct Col {
+    const char* header;
+    int width;  // display width, not counting the 2-space separator
+};
+
+// Returns the total display width of columns [first, last) including gaps.
+static int colsWidth(const Col* cols, int first, int last) {
+    int w = 0;
+    for (int i = first; i < last; i++) {
+        if (i > first) w += 2;  // separator
+        w += cols[i].width;
+    }
+    return w;
+}
+
+// Print a banner row. Each entry in `spans` is {first_col, last_col, label}.
+// Columns not covered by any span are printed as blank space.
+struct Span { int first, last; const char* label; };
+
+static void printBanner(const Col* cols, int ncols,
+                        const Col* rowkey,           // leading row-key column (may be null)
+                        const Span* spans, int nspans) {
+    // Leading row-key blank
+    if (rowkey) printf("  %-*s", rowkey->width, "");
+
+    for (int c = 0; c < ncols; ) {
+        // find if this column starts a span
+        const Span* sp = nullptr;
+        for (int s = 0; s < nspans; s++)
+            if (spans[s].first == c) { sp = &spans[s]; break; }
+
+        printf("  ");  // separator before every column group
+        if (sp) {
+            int w = colsWidth(cols, sp->first, sp->last);
+            // centre label: pad evenly on left, remainder on right
+            int llen = (int)strlen(sp->label);
+            int pad  = w - llen;
+            int lpad = pad / 2, rpad = pad - lpad;
+            printf("%*s%s%*s", lpad, "", sp->label, rpad, "");
+            c = sp->last;
+        } else {
+            printf("%-*s", cols[c].width, "");
+            c++;
+        }
+    }
+    printf("\n");
+}
+
+// Print the header row (column labels).
+static void printHeader(const Col* cols, int ncols, const Col* rowkey) {
+    if (rowkey) printf("  %-*s", rowkey->width, rowkey->header);
+    for (int c = 0; c < ncols; c++)
+        printf("  %-*s", cols[c].width, cols[c].header);
+    printf("\n");
+}
+
+// Print the separator row (dashes under each column).
+static void printSep(const Col* cols, int ncols, const Col* rowkey) {
+    auto dashes = [](int w) {
+        for (int i = 0; i < w; i++) putchar('-');
+    };
+    printf("  ");
+    if (rowkey) { dashes(rowkey->width); printf("  "); }
+    for (int c = 0; c < ncols; c++) {
+        if (c > 0) printf("  ");
+        dashes(cols[c].width);
+    }
+    printf("\n");
+}
+
+// ---------------------------------------------------------------------------
 // CPU reference
 // ---------------------------------------------------------------------------
 
@@ -220,28 +300,37 @@ int main() {
     const long long M_          = 65536;
     const long long W_          = B / 32;
     const long long tree_nodes_ = 2 * M_ - 1;
-    const long long HS_PASSES   = 16;  // log2(num_blocks) for Hillis-Steele
-    const long long TREE_LEVELS = 16;  // log2(M) for tree ascent/descent
 
     // Traffic shared by both kernels: P1 + P2 tree build.
     const long long common =
           (long long)N * 4             // P1 read input
         + (long long)N * 4             // P1 write output
-        + num_blocks_ * B * 4          // P1 write leaves
         + num_blocks_ * W_ * 4         // P1 write warp-mins
         + num_blocks_ * 4              // P1 write block-mins
         + M_ * 4                       // P2 fill tree leaves
         + (tree_nodes_ - M_) * 2 * 4  // P2 tree reduce read
         + (tree_nodes_ - M_) * 4;     // P2 tree reduce write
 
-    // SPT adds Hillis-Steele prefix-min scan on top of common.
-    const long long spt_hs = HS_PASSES * num_blocks_ * 4 * 2;  // R+W each pass
+    // WSTL Pass 1 additionally writes the leaves array; SPT skips it (its
+    // Phase 3 reads d_in directly, which is byte-identical to the leaves).
+    const long long wstl_common = common + num_blocks_ * B * 4;
+    // SPT writes d_prefix_min once (tree-ascent reads are L2-cached), the
+    // unresolved bitmask (1 bit/element, written in P1 and read in P3), and
+    // reads each block's first element in P3 for the whole-block early-out
+    // (first element is always unresolved and is the max of the block's
+    // unresolved elements, which form a non-increasing sequence).
+    const long long bm_bytes    = num_blocks_ * (B / 32) * 4;  // N/8 bytes
+    const long long spt_common  = common
+        + num_blocks_ * 4        // write d_prefix_min
+        + num_blocks_ * 4        // P3 read d_in[first-of-block] early-out test
+        + bm_bytes;
 
-    // Per-element inter-block lookup cost (random input):
-    // avg tree walk: ascent to find block (~8 levels) + descent (~8 levels) = 16 reads.
-    // avg warp-min + leaf scan: W=16 warp-min reads + ~17 leaf reads = 33 reads.
-    const long long avg_tree_per_elem    = TREE_LEVELS;  // 16 reads
-    const long long avg_wm_leaf_per_elem = W_ + 17;      // 33 reads
+    // Per-element inter-block lookup cost (random input); tree-walk reads
+    // are L2-cached and excluded.
+    // WSTL scalar scan: W=16 warp-min reads + ~17 leaf reads (early exit) = 33 reads.
+    // SPT warp-coop scan: full W=16 warp-min load + 32-leaf load = 48 reads.
+    const long long avg_wm_leaf_per_elem = W_ + 17;      // 33 reads (WSTL)
+    const long long spt_wm_leaf_per_elem = W_ + 32;      // 48 reads (SPT)
 
     // Per-input analytical traffic (bytes).
     //
@@ -263,35 +352,36 @@ int main() {
         {"random",
             // WSTL random: ~1.3% of elements do inter-block lookup
             // tree reads excluded (L2-cached); warp-min+leaf reads are DRAM
-            common
+            wstl_common
             + (long long)N * 4                                    // P3 read d_out
             + n_rand * 4                                          // P3 read d_in (inter-block only)
             + n_rand * avg_wm_leaf_per_elem * 4,                 // P3 warp-min+leaf scan
-            // SPT random: same inter-block lookup, plus prefix-min overhead
-            common + spt_hs
-            + (long long)N * 4                                    // P3 read d_out
-            + (long long)N * 4                                    // P3 read d_in (all, prefix-min check)
+            // SPT random: d_in read only for unresolved elements (queue pass)
+            spt_common
+            + bm_bytes                                            // P3 read bitmask
+            + n_rand * 4                                          // P3 read d_in (unresolved only)
             + num_blocks_ * 4                                     // P3 read d_prefix_min
-            + n_rand * avg_wm_leaf_per_elem * 4},                // P3 warp-min+leaf scan
+            + n_rand * spt_wm_leaf_per_elem * 4},                // P3 warp-coop wm+leaf scan
         {"descending",
             // WSTL descending: all N elements do tree ascent (no match, no wm/leaf)
             // tree reads excluded (L2-cached); only d_out and d_in reads remain in P3
-            common
+            wstl_common
             + (long long)N * 4                                    // P3 read d_out
             + (long long)N * 4,                                   // P3 read d_in
-            // SPT descending: prefix-min fires for all -> no tree/wm/leaf reads
-            common + spt_hs
-            + (long long)N * 4                                    // P3 read d_out
-            + (long long)N * 4                                    // P3 read d_in (prefix-min check)
+            // SPT descending: whole-block early-out fires for every block ->
+            // P3 reads only the bitmask + first-of-block d_in (in spt_common)
+            spt_common
+            + bm_bytes                                            // P3 read bitmask
             + num_blocks_ * 4},                                   // P3 read d_prefix_min
         {"ascending",
             // WSTL ascending: 0% inter-block; P3 reads d_out and exits immediately
-            common + (long long)N * 4,
-            // SPT ascending: reads d_out + d_in + d_prefix_min for the check
-            common + spt_hs
-            + (long long)N * 4                                    // P3 read d_out
-            + (long long)N * 4                                    // P3 read d_in
-            + num_blocks_ * 4},                                   // P3 read d_prefix_min
+            wstl_common + (long long)N * 4,
+            // SPT ascending: 1 unresolved element per block (its first element)
+            spt_common
+            + bm_bytes                                            // P3 read bitmask
+            + num_blocks_ * 4                                     // P3 read d_in (first-of-block)
+            + num_blocks_ * 4                                     // P3 read d_prefix_min
+            + num_blocks_ * spt_wm_leaf_per_elem * 4},           // P3 warp-coop wm+leaf scan
     };
 
     const double peak_gbps = (double)prop.memoryClockRate * 1e3
@@ -304,14 +394,14 @@ int main() {
     // Note: tree reads excluded (524 KB tree fits in L2, not DRAM traffic).
     printf("\n=== Benchmark (N=%d, peak=%.0f GB/s) ===\n", N, peak_gbps);
     printf("  useful = input+output only.  total = all DRAM reads+writes (analytical).\n");
-    // Each half: 11 + 2 + 11 = 24 chars; banner must be exactly 24 chars wide
-    printf("  %-11s  %-24s  %-24s\n", "",
-           "--------- WSTL ---------",
-           "--------- SPT  ---------");
-    printf("  %-11s  %11s  %11s  %11s  %11s\n",
-           "input", "useful", "total", "useful", "total");
-    printf("  %-11s  %11s  %11s  %11s  %11s\n",
-           "-----", "-----------", "-----------", "-----------", "-----------");
+    {
+        Col rowkey = {"input", 11};
+        Col cols[] = {{"useful", 11}, {"total", 11}, {"useful", 11}, {"total", 11}};
+        Span spans[] = {{0, 2, "WSTL"}, {2, 4, "SPT"}};
+        printBanner(cols, 4, &rowkey, spans, 2);
+        printHeader(cols, 4, &rowkey);
+        printSep   (cols, 4, &rowkey);
+    }
 
     int ti = 0;
     for (auto& inp : inputs) {
@@ -343,11 +433,22 @@ int main() {
     cudaFree(d_out);
 
     // -------------------------------------------------------------------------
-    // N sweep: useful GB/s (2*N*4 / time) across input sizes, random input only
+    // N sweep: useful GB/s (2*N*4 / time) across input sizes
+    // columns: random | descending (worst) | ascending (best)
     // -------------------------------------------------------------------------
-    printf("\n=== N sweep (random input, useful GB/s = 2*N*4 / time) ===\n");
-    printf("  %-14s  %11s  %11s\n", "N", "WSTL", "SPT");
-    printf("  %-14s  %11s  %11s\n", "-", "-----------", "-----------");
+    printf("\n=== N sweep (useful GB/s = 2*N*4 / time) ===\n");
+    {
+        Col rowkey = {"N", 14};
+        Col cols[] = {
+            {"WSTL", 11}, {"SPT", 11},
+            {"WSTL", 11}, {"SPT", 11},
+            {"WSTL", 11}, {"SPT", 11},
+        };
+        Span spans[] = {{0, 2, "random"}, {2, 4, "descend"}, {4, 6, "ascend"}};
+        printBanner(cols, 6, &rowkey, spans, 3);
+        printHeader(cols, 6, &rowkey);
+        printSep   (cols, 6, &rowkey);
+    }
 
     int ns[] = {
         1 << 14,          //   16K
@@ -358,33 +459,60 @@ int main() {
         1 << 24,          //   16M
         32 * 1024 * 1024, //   32M
         64 * 1024 * 1024, //   64M
-        128 * 1024 * 1024,// ~128M (500 MiB)
+        128 * 1024 * 1024,// ~128M
     };
 
     for (int n : ns) {
         long long brw = 2LL * n * sizeof(int);
-        std::vector<int> hn(n);
-        for (int i = 0; i < n; i++) hn[i] = rand();
 
         int *din, *dout;
         gpuAssert(cudaMalloc(&din,  n * sizeof(int)));
         gpuAssert(cudaMalloc(&dout, n * sizeof(int)));
-        gpuAssert(cudaMemcpy(din, hn.data(), n * sizeof(int), cudaMemcpyHostToDevice));
 
         auto sw = allocWSTLScratch<int,128,4>(n);
         auto ss = allocSPTScratch <int,128,4>(n);
 
-        double ms_w = benchKernelMs([&]{ runWSTL<int,128,4>(din, dout, n, sw); }, 2, 7);
-        double ms_s = benchKernelMs([&]{ runSPT <int,128,4>(din, dout, n, ss); }, 2, 7);
+        // --- random ---
+        {
+            std::vector<int> hn(n);
+            for (int i = 0; i < n; i++) hn[i] = rand();
+            gpuAssert(cudaMemcpy(din, hn.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+        }
+        double ms_wr = benchKernelMs([&]{ runWSTL<int,128,4>(din, dout, n, sw); }, 2, 7);
+        double ms_sr = benchKernelMs([&]{ runSPT <int,128,4>(din, dout, n, ss); }, 2, 7);
+
+        // --- descending (worst case: every PSE = -1) ---
+        {
+            std::vector<int> hn(n);
+            for (int i = 0; i < n; i++) hn[i] = n - i;
+            gpuAssert(cudaMemcpy(din, hn.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+        }
+        double ms_wd = benchKernelMs([&]{ runWSTL<int,128,4>(din, dout, n, sw); }, 2, 7);
+        double ms_sd = benchKernelMs([&]{ runSPT <int,128,4>(din, dout, n, ss); }, 2, 7);
+
+        // --- ascending (best case: every PSE = i-1) ---
+        {
+            std::vector<int> hn(n);
+            for (int i = 0; i < n; i++) hn[i] = i;
+            gpuAssert(cudaMemcpy(din, hn.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+        }
+        double ms_wa = benchKernelMs([&]{ runWSTL<int,128,4>(din, dout, n, sw); }, 2, 7);
+        double ms_sa = benchKernelMs([&]{ runSPT <int,128,4>(din, dout, n, ss); }, 2, 7);
 
         freeWSTLScratch<int,128,4>(sw);
         freeSPTScratch <int,128,4>(ss);
         cudaFree(din);
         cudaFree(dout);
 
-        double gbs_w = (double)brw / (ms_w * 1e-3) / 1e9;
-        double gbs_s = (double)brw / (ms_s * 1e-3) / 1e9;
-        printf("  %-14d  %6.1f GB/s  %6.1f GB/s\n", n, gbs_w, gbs_s);
+        double gbs = (double)brw / 1e9;
+        double gbs_wr = gbs / (ms_wr * 1e-3);
+        double gbs_sr = gbs / (ms_sr * 1e-3);
+        double gbs_wd = gbs / (ms_wd * 1e-3);
+        double gbs_sd = gbs / (ms_sd * 1e-3);
+        double gbs_wa = gbs / (ms_wa * 1e-3);
+        double gbs_sa = gbs / (ms_sa * 1e-3);
+        printf("  %-14d  %6.1f GB/s  %6.1f GB/s  %6.1f GB/s  %6.1f GB/s  %6.1f GB/s  %6.1f GB/s\n",
+               n, gbs_wr, gbs_sr, gbs_wd, gbs_sd, gbs_wa, gbs_sa);
     }
 
     printf("\n");

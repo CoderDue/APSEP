@@ -2639,7 +2639,7 @@ void apsepKernelSPT(
         int                     num_blocks,
         int                     M,            // next pow2 >= num_blocks
         int                     leaf_offset,  // M - 1
-        T* __restrict__         d_block_leaves,
+        unsigned* __restrict__  d_unres,      // 1 bit/element: needs inter-block lookup
         T* __restrict__         d_block_mins,
         T* __restrict__         d_block_warp_mins,
         T* __restrict__         d_tree,       // 2*M-1 nodes
@@ -2659,25 +2659,35 @@ void apsepKernelSPT(
 
     __shared__ T s_elems[B];
     __shared__ T s_stripe_min[IPT][NUM_WARPS];
+    __shared__ int s_queue[B];   // Phase 3: indices needing inter-block lookup
+    __shared__ int s_qcount;
+
+    static_assert(W <= 32, "warp-cooperative Phase 3 assumes W <= 32");
 
     // -------------------------------------------------------------------------
     // Phase 1: each physical block processes its logical blocks
     // -------------------------------------------------------------------------
     for (int block_id = phys_bid; block_id < num_blocks; block_id += num_phys) {
         const int glb_offs = block_id * B;
+        T* se = s_elems;
+        T (*sm)[NUM_WARPS] = s_stripe_min;
 
+        // No barrier between the shared store and the warp scan: the scan
+        // only needs the thread's own element, kept in v[]; cross-thread
+        // se reads happen after the __syncthreads below.
+        T v[IPT];
         #pragma unroll
         for (int i = 0; i < IPT; i++) {
             int lid = i * BLOCK_SIZE + threadIdx.x;
             int gid = glb_offs + lid;
-            s_elems[lid] = (gid < n) ? d_in[gid] : INF;
+            v[i] = (gid < n) ? d_in[gid] : INF;
+            se[lid] = v[i];
         }
-        __syncthreads();
 
         T left_carry[IPT];
         #pragma unroll
         for (int ipt = 0; ipt < IPT; ipt++) {
-            T c = s_elems[ipt * BLOCK_SIZE + threadIdx.x];
+            T c = v[ipt];
             #pragma unroll
             for (int step = 1; step <= 16; step <<= 1) {
                 T nb = __shfl_up_sync(0xffffffff, c, step);
@@ -2685,7 +2695,7 @@ void apsepKernelSPT(
             }
             left_carry[ipt] = __shfl_up_sync(0xffffffff, c, 1);
             T wm = __shfl_sync(0xffffffff, c, 31);
-            if (lane == 0) s_stripe_min[ipt][warp_id] = wm;
+            if (lane == 0) sm[ipt][warp_id] = wm;
         }
         __syncthreads();
 
@@ -2694,59 +2704,82 @@ void apsepKernelSPT(
         for (int ipt = 0; ipt < IPT; ipt++) {
             int lid = ipt * BLOCK_SIZE + threadIdx.x;
             int gid = glb_offs + lid;
-            if (gid >= n) continue;
-            T val = s_elems[lid];
+            bool active = (gid < n);
+            T val = v[ipt];
             int result = -1;
 
-            if (lane > 0 && left_carry[ipt] < val) {
-                int base = ipt * BLOCK_SIZE + warp_id * 32;
-                for (int k = lane - 1; k >= 0; k--)
-                    if (s_elems[base + k] < val) { result = base + k; break; }
-            }
-            if (result < 0) {
-                for (int w = warp_id - 1; w >= 0 && result < 0; w--) {
-                    if (s_stripe_min[ipt][w] < val) {
-                        int wb = ipt * BLOCK_SIZE + w * 32;
-                        for (int k = 31; k >= 0; k--)
-                            if (s_elems[wb + k] < val) { result = wb + k; break; }
-                    }
+            // Within-warp ANSV via synchronous pointer jumping: each lane
+            // tracks a candidate index g; lanes whose candidate is not yet
+            // smaller jump to the candidate's candidate (distance doubles
+            // per round).  Uniform warp execution replaces the divergent
+            // backward scan (profiled at 10.5/32 active threads on random).
+            // All lanes participate in the shuffles (inactive lanes hold
+            // val=INF and g=-1, never acting as jump sources for active
+            // lanes since lower lanes in a warp are always active).
+            bool has_within = active && (lane > 0) && (left_carry[ipt] < val);
+            if (__any_sync(0xffffffff, has_within)) {
+                int g = has_within ? lane - 1 : -1;
+                while (true) {
+                    int src = (g >= 0) ? g : 0;
+                    T   eg  = __shfl_sync(0xffffffff, val, src);
+                    int gg  = __shfl_sync(0xffffffff, g,   src);
+                    bool jump = (g >= 0) && (eg >= val);
+                    if (!__any_sync(0xffffffff, jump)) break;
+                    if (jump) g = gg;
                 }
+                if (g >= 0)
+                    result = ipt * BLOCK_SIZE + warp_id * 32 + g;
             }
-            if (result < 0) {
-                for (int i = ipt - 1; i >= 0 && result < 0; i--) {
-                    for (int w = NUM_WARPS - 1; w >= 0 && result < 0; w--) {
-                        if (s_stripe_min[i][w] < val) {
-                            int wb = i * BLOCK_SIZE + w * 32;
+            if (active) {
+                if (result < 0) {
+                    for (int w = warp_id - 1; w >= 0 && result < 0; w--) {
+                        if (sm[ipt][w] < val) {
+                            int wb = ipt * BLOCK_SIZE + w * 32;
                             for (int k = 31; k >= 0; k--)
-                                if (s_elems[wb + k] < val) { result = wb + k; break; }
+                                if (se[wb + k] < val) { result = wb + k; break; }
                         }
                     }
                 }
+                if (result < 0) {
+                    for (int i = ipt - 1; i >= 0 && result < 0; i--) {
+                        for (int w = NUM_WARPS - 1; w >= 0 && result < 0; w--) {
+                            if (sm[i][w] < val) {
+                                int wb = i * BLOCK_SIZE + w * 32;
+                                for (int k = 31; k >= 0; k--)
+                                    if (se[wb + k] < val) { result = wb + k; break; }
+                            }
+                        }
+                    }
+                }
+                if (result >= 0) d_out[gid] = glb_offs + result;
             }
-            d_out[gid] = (result >= 0) ? (glb_offs + result) : INT_MIN;
+            // Publish unresolved bits, one word per warp.  Unresolved
+            // elements get no d_out write here — Phase 3 writes them exactly
+            // once, so every output byte is written once total (the old
+            // INT_MIN sentinel forced a full d_out re-read in Phase 3).
+            unsigned um = __ballot_sync(0xffffffff, active && result < 0);
+            if (lane == 0)
+                d_unres[(unsigned)(glb_offs + ipt * BLOCK_SIZE + warp_id * 32) >> 5] = um;
         }
 
-        // Publish leaves, warp-mins, block_min
-        T* g_leaves = d_block_leaves + (size_t)block_id * B;
-        for (int i = threadIdx.x; i < B; i += BLOCK_SIZE)
-            g_leaves[i] = s_elems[i];
-
+        // Publish warp-mins and block_min.  No leaf publish: the leaves of a
+        // complete block are byte-identical to d_in at the same offsets, so
+        // Phase 3 reads d_in directly (saves a 4-byte-per-element write).
         if (lane == 0) {
             T* g_wm = d_block_warp_mins + (size_t)block_id * W;
             for (int ipt = 0; ipt < IPT; ipt++)
-                g_wm[ipt * NUM_WARPS + warp_id] = s_stripe_min[ipt][warp_id];
+                g_wm[ipt * NUM_WARPS + warp_id] = sm[ipt][warp_id];
         }
 
         // Reduce block_min using first warp across all IPT*NUM_WARPS stripe mins (W values)
         if (warp_id == 0) {
-            T bmin = (lane < W) ? s_stripe_min[lane / NUM_WARPS][lane % NUM_WARPS] : INF;
+            T bmin = (lane < W) ? sm[lane / NUM_WARPS][lane % NUM_WARPS] : INF;
             #pragma unroll
             for (int step = 16; step >= 1; step >>= 1)
                 bmin = min(bmin, __shfl_xor_sync(0xffffffff, bmin, step));
             if (lane == 0) d_block_mins[block_id] = bmin;
         }
-
-        __syncthreads();  // ensure all writes committed before grid.sync
+        __syncthreads();  // s_elems/s_stripe_min still read above; next iteration overwrites
     }
 
     // -------------------------------------------------------------------------
@@ -2783,41 +2816,75 @@ void apsepKernelSPT(
     // -------------------------------------------------------------------------
     grid.sync();
 
-    // Parallel prefix-min scan: use Hillis-Steele upsweep into d_prefix_min.
-    // d_prefix_min[b] = min(block_min[0..b-1]) (exclusive prefix min).
-    // Pass 0: copy block_mins into d_prefix_min (shift right by 1, pad INF at [0]).
-    {
-        const T INF2 = ApsepInfinity<T>::value();
-        for (int i = phys_bid * BLOCK_SIZE + threadIdx.x; i < num_blocks; i += num_phys * BLOCK_SIZE)
-            d_prefix_min[i] = (i > 0) ? d_block_mins[i - 1] : INF2;
-    }
-    // Hillis-Steele prefix-min scan: log2(num_blocks) passes.
-    for (int stride = 1; stride < num_blocks; stride <<= 1) {
-        grid.sync();
-        for (int i = phys_bid * BLOCK_SIZE + threadIdx.x; i < num_blocks; i += num_phys * BLOCK_SIZE) {
-            if (i >= stride)
-                d_prefix_min[i] = min(d_prefix_min[i], d_prefix_min[i - stride]);
+    // Exclusive prefix-min: d_prefix_min[b] = min(block_min[0..b-1]).
+    // Computed per block by ascending the already-built min-tree and taking
+    // the min over left siblings on the leaf-to-root path (their subtrees
+    // cover exactly leaves [0, b)).  O(log M) L2-cached reads per block and
+    // a single pass, replacing the Hillis-Steele scan's log2(M) grid.sync
+    // passes and 8 MB of DRAM traffic.
+    for (int b = phys_bid * BLOCK_SIZE + threadIdx.x; b < num_blocks; b += num_phys * BLOCK_SIZE) {
+        T pm = INF;
+        int node = leaf_offset + b;
+        while (node > 0) {
+            if (node % 2 == 0)
+                pm = min(pm, __ldg(&d_tree[node - 1]));
+            node = (node - 1) / 2;
         }
+        d_prefix_min[b] = pm;
     }
     grid.sync();
 
     // -------------------------------------------------------------------------
-    // Phase 3: tree query + leaf scan for elements with d_out == INT_MIN
+    // Phase 3: tree query + leaf scan for elements flagged in d_unres
     // -------------------------------------------------------------------------
 
     for (int block_id = phys_bid; block_id < num_blocks; block_id += num_phys) {
         const int glb_offs = block_id * B;
         const T prefix_min_b = d_prefix_min[block_id];  // min(block_min[0..block_id-1])
 
+        // Whole-block early-out: unresolved elements within a block form a
+        // non-increasing sequence (were an earlier one smaller, the later one
+        // would have resolved intra-block), and the block's first element is
+        // always unresolved — so it is the max of all unresolved elements.
+        // If prefix_min_b >= that first element, every unresolved element in
+        // the block resolves to -1 (the descending worst case takes this path
+        // for all blocks).
+        if (prefix_min_b >= __ldg(&d_in[glb_offs])) {
+            for (int i = threadIdx.x; i < B; i += BLOCK_SIZE) {
+                int gid = glb_offs + i;
+                if (gid >= n) continue;
+                unsigned um = __ldg(&d_unres[(unsigned)gid >> 5]);
+                if ((um >> (gid & 31)) & 1u) d_out[gid] = -1;
+            }
+            continue;
+        }
+
+        // Collect elements needing inter-block lookup into a shared queue,
+        // applying the O(1) prefix-min early exit inline.
+        if (threadIdx.x == 0) s_qcount = 0;
+        __syncthreads();
+
         for (int i = threadIdx.x; i < B; i += BLOCK_SIZE) {
             int gid = glb_offs + i;
             if (gid >= n) continue;
-            if (d_out[gid] != INT_MIN) continue;
+            unsigned um = __ldg(&d_unres[(unsigned)gid >> 5]);  // warp-uniform word
+            if (!((um >> (gid & 31)) & 1u)) continue;
 
             T val = d_in[gid];
-
-            // O(1) early exit: if min of all preceding block_mins >= val, answer is -1
             if (prefix_min_b >= val) { d_out[gid] = -1; continue; }
+            s_queue[atomicAdd(&s_qcount, 1)] = i;
+        }
+        __syncthreads();
+
+        // Warp-cooperative processing, one queued element per warp.  The
+        // tree walk runs redundantly on all lanes (identical L2-cached
+        // addresses broadcast within the warp); the warp-min and leaf scans
+        // become two 32-wide coalesced loads + __ballot_sync instead of up
+        // to 48 dependent scalar loads with early exit.
+        const int qn = s_qcount;
+        for (int q = warp_id; q < qn; q += NUM_WARPS) {
+            int gid = glb_offs + s_queue[q];
+            T val = __ldg(&d_in[gid]);
 
             // Ascent+descent on block-level tree
             int node = leaf_offset + block_id;
@@ -2839,26 +2906,28 @@ void apsepKernelSPT(
                 node = (node - 1) / 2;
             }
 
-            if (found_block < 0) { d_out[gid] = -1; continue; }
-
-            // Scan warp-mins then 32 leaves in found_block
-            const T* wm = d_block_warp_mins + (size_t)found_block * W;
             int result = -1;
-            for (int w = W - 1; w >= 0 && result < 0; w--) {
-                if (__ldg(&wm[w]) < val) {
-                    const T* bl = d_block_leaves + (size_t)found_block * B + w * 32;
-                    for (int k = 31; k >= 0; k--)
-                        if (__ldg(&bl[k]) < val) { result = found_block * B + w * 32 + k; break; }
-                }
+            if (found_block >= 0) {
+                // found_block's block_min < val, so both ballots are nonzero.
+                const T* wm = d_block_warp_mins + (size_t)found_block * W;
+                T wv = (lane < W) ? __ldg(&wm[lane]) : INF;
+                unsigned wmask = __ballot_sync(0xffffffff, wv < val);
+                int wstar = 31 - __clz(wmask);
+                // found_block < block_id, so all B of its elements are < n:
+                // reading d_in here is safe and identical to the old leaves.
+                const T* bl = d_in + (size_t)found_block * B + wstar * 32;
+                unsigned lmask = __ballot_sync(0xffffffff, __ldg(&bl[lane]) < val);
+                result = found_block * B + wstar * 32 + (31 - __clz(lmask));
             }
-            d_out[gid] = result;
+            if (lane == 0) d_out[gid] = result;
         }
+        __syncthreads();
     }
 }
 
 template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
 struct SPTScratch {
-    T*    d_block_leaves    = nullptr;
+    unsigned* d_unres       = nullptr;  // 1 bit/element: needs inter-block lookup
     T*    d_block_mins      = nullptr;
     T*    d_block_warp_mins = nullptr;
     T*    d_tree            = nullptr;
@@ -2889,7 +2958,7 @@ SPTScratch<T, BLOCK_SIZE, IPT> allocSPTScratch(int n) {
     gpuAssert(cudaGetDeviceProperties(&prop, 0));
     s.num_phys = blocks_per_sm * prop.multiProcessorCount;
 
-    gpuAssert(cudaMalloc(&s.d_block_leaves,    (size_t)s.num_blocks * B  * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_unres,           (size_t)s.num_blocks * (B / 32) * sizeof(unsigned)));
     gpuAssert(cudaMalloc(&s.d_block_mins,      (size_t)s.num_blocks      * sizeof(T)));
     gpuAssert(cudaMalloc(&s.d_block_warp_mins, (size_t)s.num_blocks * W  * sizeof(T)));
     gpuAssert(cudaMalloc(&s.d_tree,            (size_t)(2 * s.M - 1)     * sizeof(T)));
@@ -2899,7 +2968,7 @@ SPTScratch<T, BLOCK_SIZE, IPT> allocSPTScratch(int n) {
 
 template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
 void freeSPTScratch(SPTScratch<T, BLOCK_SIZE, IPT>& s) {
-    cudaFree(s.d_block_leaves);
+    cudaFree(s.d_unres);
     cudaFree(s.d_block_mins);
     cudaFree(s.d_block_warp_mins);
     cudaFree(s.d_tree);
@@ -2914,7 +2983,7 @@ void runSPT(const T* d_in, int* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s)
     void* args[] = {
         (void*)&d_in, (void*)&d_out, (void*)&n,
         (void*)&s.num_blocks, (void*)&s.M, (void*)&s.leaf_offset,
-        (void*)&s.d_block_leaves, (void*)&s.d_block_mins,
+        (void*)&s.d_unres, (void*)&s.d_block_mins,
         (void*)&s.d_block_warp_mins, (void*)&s.d_tree,
         (void*)&s.d_prefix_min
     };
