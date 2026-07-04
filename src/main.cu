@@ -253,35 +253,41 @@ int main() {
     // ascending:  0% inter-block; P3 trivially skips all elements (d_out != INT_MIN).
     const long long n_rand = (long long)(N * 0.013);  // ~1.3% measured
 
+    // The min-tree (2*M-1 nodes, 524 KB) fits in L2 cache (1.5 MB), so tree reads
+    // do not consume DRAM bandwidth and are excluded from traffic estimates.
+    // Leaf arrays (num_blocks*B*4 = 134 MB) and warp-min arrays (4 MB) are too
+    // large for L2 and do hit DRAM.
+
     struct TrafficRow { const char* label; long long wstl; long long spt; };
     TrafficRow traffic[] = {
         {"random",
-            // WSTL random
+            // WSTL random: ~1.3% of elements do inter-block lookup
+            // tree reads excluded (L2-cached); warp-min+leaf reads are DRAM
             common
             + (long long)N * 4                                    // P3 read d_out
             + n_rand * 4                                          // P3 read d_in (inter-block only)
-            + n_rand * (avg_tree_per_elem + avg_wm_leaf_per_elem) * 4,
-            // SPT random
+            + n_rand * avg_wm_leaf_per_elem * 4,                 // P3 warp-min+leaf scan
+            // SPT random: same inter-block lookup, plus prefix-min overhead
             common + spt_hs
             + (long long)N * 4                                    // P3 read d_out
             + (long long)N * 4                                    // P3 read d_in (all, prefix-min check)
             + num_blocks_ * 4                                     // P3 read d_prefix_min
-            + n_rand * (avg_tree_per_elem + avg_wm_leaf_per_elem) * 4},
+            + n_rand * avg_wm_leaf_per_elem * 4},                // P3 warp-min+leaf scan
         {"descending",
-            // WSTL descending: every element ascends 16 levels, no match -> no wm/leaf
+            // WSTL descending: all N elements do tree ascent (no match, no wm/leaf)
+            // tree reads excluded (L2-cached); only d_out and d_in reads remain in P3
             common
             + (long long)N * 4                                    // P3 read d_out
-            + (long long)N * 4                                    // P3 read d_in
-            + (long long)N * TREE_LEVELS * 4,                    // P3 tree ascent (no match)
-            // SPT descending: prefix-min fires for all -> 0 tree/wm/leaf
+            + (long long)N * 4,                                   // P3 read d_in
+            // SPT descending: prefix-min fires for all -> no tree/wm/leaf reads
             common + spt_hs
             + (long long)N * 4                                    // P3 read d_out
             + (long long)N * 4                                    // P3 read d_in (prefix-min check)
             + num_blocks_ * 4},                                   // P3 read d_prefix_min
         {"ascending",
-            // WSTL ascending: 0% inter-block, P3 reads d_out only (exits immediately)
+            // WSTL ascending: 0% inter-block; P3 reads d_out and exits immediately
             common + (long long)N * 4,
-            // SPT ascending: same but also reads d_in + d_prefix_min for the check
+            // SPT ascending: reads d_out + d_in + d_prefix_min for the check
             common + spt_hs
             + (long long)N * 4                                    // P3 read d_out
             + (long long)N * 4                                    // P3 read d_in
