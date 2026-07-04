@@ -301,18 +301,17 @@ int main() {
     //   useful:  input+output only (2*N*4 bytes / time)
     //   total:   all reads+writes including intermediates / time
     //   %peak:   total GB/s as % of hardware peak (288 GB/s)
-    // Note: tree reads may be L2-cached, so total GB/s can overstate DRAM pressure.
+    // Note: tree reads excluded (524 KB tree fits in L2, not DRAM traffic).
     printf("\n=== Benchmark (N=%d, peak=%.0f GB/s) ===\n", N, peak_gbps);
-    printf("  useful = input+output only.  total = all reads+writes (analytical estimate).\n");
-    printf("  %%peak = total GB/s / %.0f GB/s hardware peak.\n", peak_gbps);
-    // Each half: 11 + 2 + 11 + 2 + 6 = 32 chars
-    printf("  %-11s  %-32s  %-32s\n", "",
-           "-------------- WSTL --------------",
-           "-------------- SPT  --------------");
-    printf("  %-11s  %11s  %11s  %6s  %11s  %11s  %6s\n",
-           "input", "useful", "total", "%peak", "useful", "total", "%peak");
-    printf("  %-11s  %11s  %11s  %6s  %11s  %11s  %6s\n",
-           "-----", "-----------", "-----------", "------", "-----------", "-----------", "------");
+    printf("  useful = input+output only.  total = all DRAM reads+writes (analytical).\n");
+    // Each half: 11 + 2 + 11 = 24 chars; banner must be exactly 24 chars wide
+    printf("  %-11s  %-24s  %-24s\n", "",
+           "--------- WSTL ---------",
+           "--------- SPT  ---------");
+    printf("  %-11s  %11s  %11s  %11s  %11s\n",
+           "input", "useful", "total", "useful", "total");
+    printf("  %-11s  %11s  %11s  %11s  %11s\n",
+           "-----", "-----------", "-----------", "-----------", "-----------");
 
     int ti = 0;
     for (auto& inp : inputs) {
@@ -333,10 +332,8 @@ int main() {
         double total_w  = (double)tw / (ms_wstl * 1e-3) / 1e9;
         double total_s  = (double)ts / (ms_spt  * 1e-3) / 1e9;
 
-        printf("  %-11s  %6.1f GB/s  %6.1f GB/s  %5.1f%%  %6.1f GB/s  %6.1f GB/s  %5.1f%%\n",
-               inp.label,
-               useful_w, total_w, total_w / peak_gbps * 100.0,
-               useful_s, total_s, total_s / peak_gbps * 100.0);
+        printf("  %-11s  %6.1f GB/s  %6.1f GB/s  %6.1f GB/s  %6.1f GB/s\n",
+               inp.label, useful_w, total_w, useful_s, total_s);
         ti++;
     }
 
