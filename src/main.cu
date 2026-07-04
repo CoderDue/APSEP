@@ -342,6 +342,51 @@ int main() {
     cudaFree(d_in);
     cudaFree(d_out);
 
+    // -------------------------------------------------------------------------
+    // N sweep: useful GB/s (2*N*4 / time) across input sizes, random input only
+    // -------------------------------------------------------------------------
+    printf("\n=== N sweep (random input, useful GB/s = 2*N*4 / time) ===\n");
+    printf("  %-14s  %11s  %11s\n", "N", "WSTL", "SPT");
+    printf("  %-14s  %11s  %11s\n", "-", "-----------", "-----------");
+
+    int ns[] = {
+        1 << 14,          //   16K
+        1 << 16,          //   64K
+        1 << 18,          //  256K
+        1 << 20,          //    1M
+        1 << 22,          //    4M
+        1 << 24,          //   16M
+        32 * 1024 * 1024, //   32M
+        64 * 1024 * 1024, //   64M
+        128 * 1024 * 1024,// ~128M (500 MiB)
+    };
+
+    for (int n : ns) {
+        long long brw = 2LL * n * sizeof(int);
+        std::vector<int> hn(n);
+        for (int i = 0; i < n; i++) hn[i] = rand();
+
+        int *din, *dout;
+        gpuAssert(cudaMalloc(&din,  n * sizeof(int)));
+        gpuAssert(cudaMalloc(&dout, n * sizeof(int)));
+        gpuAssert(cudaMemcpy(din, hn.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+
+        auto sw = allocWSTLScratch<int,128,4>(n);
+        auto ss = allocSPTScratch <int,128,4>(n);
+
+        double ms_w = benchKernelMs([&]{ runWSTL<int,128,4>(din, dout, n, sw); }, 2, 7);
+        double ms_s = benchKernelMs([&]{ runSPT <int,128,4>(din, dout, n, ss); }, 2, 7);
+
+        freeWSTLScratch<int,128,4>(sw);
+        freeSPTScratch <int,128,4>(ss);
+        cudaFree(din);
+        cudaFree(dout);
+
+        double gbs_w = (double)brw / (ms_w * 1e-3) / 1e9;
+        double gbs_s = (double)brw / (ms_s * 1e-3) / 1e9;
+        printf("  %-14d  %6.1f GB/s  %6.1f GB/s\n", n, gbs_w, gbs_s);
+    }
+
     printf("\n");
     bool all_ok = ok_wstl && ok_spt;
     printf("Overall: %s\n", all_ok ? "PASSED" : "FAILED");
