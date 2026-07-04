@@ -61,6 +61,14 @@ bench_spt_worst: $(SPT_WORST_TARGET)
 $(SPT_WORST_TARGET): $(SPT_WORST_SRC) src/apsep.cuh
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SPT_WORST_SRC)
 
+SPT_BLOCKED_TARGET := bench_spt_blocked
+SPT_BLOCKED_SRC    := src/bench_spt_blocked.cu
+
+bench_spt_blocked: $(SPT_BLOCKED_TARGET)
+
+$(SPT_BLOCKED_TARGET): $(SPT_BLOCKED_SRC) src/apsep.cuh
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SPT_BLOCKED_SRC)
+
 PROFILE_BN_TARGET := profile_bottleneck
 PROFILE_BN_SRC    := src/profile_bottleneck.cu
 
