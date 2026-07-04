@@ -2611,15 +2611,16 @@ void launchWSTL(const T* d_in, int* d_out, int n) {
 // in a single kernel invocation with persistent thread-blocks:
 //
 //   Phase 1: each physical block processes its assigned logical blocks
-//            sequentially (stride = num_physical_blocks).  Computes intra-block
-//            PSE, publishes block_min[b], warp-mins, leaves.
+//            sequentially (stride = num_physical_blocks).  Blocked layout:
+//            computes intra-block PSE, publishes block_min[b], chunk-mins,
+//            and the unresolved bitmask d_unres.
 //   grid.sync()
 //   Phase 2: build segment min-tree over block_mins bottom-up, one level per
 //            grid.sync().  Physical blocks share the work at each level.
 //   grid.sync() (after final tree level)
-//   Phase 3: each physical block processes its logical blocks, querying the
-//            tree (ascent+descent O(log num_blocks)) for elements with
-//            d_out==INT_MIN, then scans the found block's warp-mins + 32 leaves.
+//   Phase 3: warps grid-stride over d_unres words; each unresolved element is
+//            resolved via prefix-min (-1 case) or tree ascent+descent
+//            (O(log num_blocks)) plus a chunk-min + 32-leaf ballot.
 //
 // Constraint: grid must fit on-chip for grid.sync() → launch exactly
 //   cudaOccupancyMaxActiveBlocksPerMultiprocessor × num_SMs physical blocks.
@@ -2658,128 +2659,164 @@ void apsepKernelSPT(
     const int warp_id    = threadIdx.x >> 5;
 
     __shared__ T s_elems[B];
-    __shared__ T s_stripe_min[IPT][NUM_WARPS];
-    __shared__ int s_queue[B];   // Phase 3: indices needing inter-block lookup
-    __shared__ int s_qcount;
+    __shared__ T s_tmin[BLOCK_SIZE];
+    __shared__ T s_warp_min[NUM_WARPS];
 
+    static_assert(IPT == 4, "blocked Phase 1 assumes IPT == 4");
+    static_assert(sizeof(T) == 4, "blocked Phase 1 assumes 4-byte T (int4 loads)");
     static_assert(W <= 32, "warp-cooperative Phase 3 assumes W <= 32");
 
     // -------------------------------------------------------------------------
-    // Phase 1: each physical block processes its logical blocks
+    // Phase 1 (blocked layout): each thread owns IPT consecutive elements
+    // (one int4 load), resolves within-thread matches sequentially in
+    // registers, and runs the warp machinery (prefix-min scan, pointer-
+    // jumping ANSV chain) over per-thread mins — 4x fewer shuffles than the
+    // striped layout, and descending runs resolve with no shuffles at all.
     // -------------------------------------------------------------------------
     for (int block_id = phys_bid; block_id < num_blocks; block_id += num_phys) {
         const int glb_offs = block_id * B;
-        T* se = s_elems;
-        T (*sm)[NUM_WARPS] = s_stripe_min;
+        const int tbase    = IPT * threadIdx.x;   // block-relative
+        const bool full    = (glb_offs + B <= n);
 
-        // No barrier between the shared store and the warp scan: the scan
-        // only needs the thread's own element, kept in v[]; cross-thread
-        // se reads happen after the __syncthreads below.
         T v[IPT];
-        #pragma unroll
-        for (int i = 0; i < IPT; i++) {
-            int lid = i * BLOCK_SIZE + threadIdx.x;
-            int gid = glb_offs + lid;
-            v[i] = (gid < n) ? d_in[gid] : INF;
-            se[lid] = v[i];
-        }
-
-        T left_carry[IPT];
-        #pragma unroll
-        for (int ipt = 0; ipt < IPT; ipt++) {
-            T c = v[ipt];
+        if (full) {
+            int4 raw = *reinterpret_cast<const int4*>(d_in + glb_offs + tbase);
+            v[0] = raw.x; v[1] = raw.y; v[2] = raw.z; v[3] = raw.w;
+            *reinterpret_cast<int4*>(s_elems + tbase) = raw;
+        } else {
             #pragma unroll
-            for (int step = 1; step <= 16; step <<= 1) {
-                T nb = __shfl_up_sync(0xffffffff, c, step);
-                if (lane >= step) c = min(c, nb);
+            for (int i = 0; i < IPT; i++) {
+                int gid = glb_offs + tbase + i;
+                v[i] = (gid < n) ? d_in[gid] : INF;
+                s_elems[tbase + i] = v[i];
             }
-            left_carry[ipt] = __shfl_up_sync(0xffffffff, c, 1);
-            T wm = __shfl_sync(0xffffffff, c, 31);
-            if (lane == 0) sm[ipt][warp_id] = wm;
         }
-        __syncthreads();
 
-        // Intra-block PSE
+        // In-thread sequential ANSV (block-relative result, -1 if none)
+        int res[IPT];
+        res[0] = -1;
+        res[1] = (v[0] < v[1]) ? tbase     : -1;
+        res[2] = (v[1] < v[2]) ? tbase + 1 : (v[0] < v[2]) ? tbase : -1;
+        res[3] = (v[2] < v[3]) ? tbase + 2 : (v[1] < v[3]) ? tbase + 1
+                                           : (v[0] < v[3]) ? tbase : -1;
+
+        const T tmin = min(min(v[0], v[1]), min(v[2], v[3]));
+        s_tmin[threadIdx.x] = tmin;
+
+        // Warp inclusive prefix-min over thread mins
+        T c = tmin;
         #pragma unroll
-        for (int ipt = 0; ipt < IPT; ipt++) {
-            int lid = ipt * BLOCK_SIZE + threadIdx.x;
-            int gid = glb_offs + lid;
-            bool active = (gid < n);
-            T val = v[ipt];
-            int result = -1;
+        for (int step = 1; step <= 16; step <<= 1) {
+            T nb = __shfl_up_sync(0xffffffff, c, step);
+            if (lane >= step) c = min(c, nb);
+        }
+        const T carry = __shfl_up_sync(0xffffffff, c, 1);  // valid for lane>0
+        if (lane == 31) s_warp_min[warp_id] = c;
 
-            // Within-warp ANSV via synchronous pointer jumping: each lane
-            // tracks a candidate index g; lanes whose candidate is not yet
-            // smaller jump to the candidate's candidate (distance doubles
-            // per round).  Uniform warp execution replaces the divergent
-            // backward scan (profiled at 10.5/32 active threads on random).
-            // All lanes participate in the shuffles (inactive lanes hold
-            // val=INF and g=-1, never acting as jump sources for active
-            // lanes since lower lanes in a warp are always active).
-            bool has_within = active && (lane > 0) && (left_carry[ipt] < val);
-            if (__any_sync(0xffffffff, has_within)) {
-                int g = has_within ? lane - 1 : -1;
+        // Chunk mins (32 consecutive elements = 8 threads) for Phase 3
+        {
+            T om = tmin;
+            om = min(om, __shfl_xor_sync(0xffffffff, om, 1));
+            om = min(om, __shfl_xor_sync(0xffffffff, om, 2));
+            om = min(om, __shfl_xor_sync(0xffffffff, om, 4));
+            if ((lane & 7) == 0)
+                d_block_warp_mins[(size_t)block_id * W + warp_id * (32/8) + (lane >> 3)] = om;
+        }
+
+        __syncthreads();  // covers cross-thread s_elems/s_tmin/s_warp_min reads
+
+        // Thread-level ANSV chain over tmins (pointer jumping; each lane's
+        // query is its own tmin, so the gap-bound argument of the original
+        // element-level algorithm carries over verbatim).
+        int chain = -1;
+        {
+            bool has = (lane > 0) && (carry < tmin);
+            if (__any_sync(0xffffffff, has)) {
+                int g = has ? lane - 1 : -1;
                 while (true) {
                     int src = (g >= 0) ? g : 0;
-                    T   eg  = __shfl_sync(0xffffffff, val, src);
-                    int gg  = __shfl_sync(0xffffffff, g,   src);
-                    bool jump = (g >= 0) && (eg >= val);
+                    T   tg  = __shfl_sync(0xffffffff, tmin, src);
+                    int gg  = __shfl_sync(0xffffffff, g,    src);
+                    bool jump = (g >= 0) && (tg >= tmin);
                     if (!__any_sync(0xffffffff, jump)) break;
                     if (jump) g = gg;
                 }
-                if (g >= 0)
-                    result = ipt * BLOCK_SIZE + warp_id * 32 + g;
+                chain = g;
             }
-            if (active) {
-                if (result < 0) {
-                    for (int w = warp_id - 1; w >= 0 && result < 0; w--) {
-                        if (sm[ipt][w] < val) {
-                            int wb = ipt * BLOCK_SIZE + w * 32;
-                            for (int k = 31; k >= 0; k--)
-                                if (se[wb + k] < val) { result = wb + k; break; }
-                        }
-                    }
+        }
+
+        // Per-element resolution.  Locally-unresolved elements of a thread
+        // are its prefix minima (non-increasing), so the spine walk position
+        // `cur` is monotone across i and can be reused.
+        unsigned bal[IPT];
+        int cur = lane - 1;
+        #pragma unroll
+        for (int i = 0; i < IPT; i++) {
+            const bool active = full || (glb_offs + tbase + i < n);
+            const T val = v[i];
+            bool pending = active && (res[i] < 0) && (lane > 0) && (carry < val);
+
+            if (__any_sync(0xffffffff, pending)) {
+                // Walk cur along the chain while tmin[cur] >= val.  Threads
+                // strictly between cur and lane always have tmin >= val, so
+                // the walk cannot skip the answer; pending guarantees the
+                // answer exists, so cur lands on it (never -1).
+                while (true) {
+                    int src = (pending && cur >= 0) ? cur : 0;
+                    T   tg  = __shfl_sync(0xffffffff, tmin,  src);
+                    int cg  = __shfl_sync(0xffffffff, chain, src);
+                    bool step = pending && (cur >= 0) && (tg >= val);
+                    if (!__any_sync(0xffffffff, step)) break;
+                    if (step) cur = cg;
                 }
-                if (result < 0) {
-                    for (int i = ipt - 1; i >= 0 && result < 0; i--) {
-                        for (int w = NUM_WARPS - 1; w >= 0 && result < 0; w--) {
-                            if (sm[i][w] < val) {
-                                int wb = i * BLOCK_SIZE + w * 32;
-                                for (int k = 31; k >= 0; k--)
-                                    if (se[wb + k] < val) { result = wb + k; break; }
+                if (pending) {
+                    int tt = warp_id * 32 + cur;
+                    const T* e = s_elems + IPT * tt;
+                    int k = (e[3] < val) ? 3 : (e[2] < val) ? 2 : (e[1] < val) ? 1 : 0;
+                    res[i] = IPT * tt + k;
+                }
+            }
+
+            // Cross-warp fallback: warp min, then thread min, then exact.
+            if (active && res[i] < 0) {
+                for (int w = warp_id - 1; w >= 0 && res[i] < 0; w--) {
+                    if (s_warp_min[w] < val) {
+                        for (int tt = 32 * w + 31; tt >= 32 * w; tt--) {
+                            if (s_tmin[tt] < val) {
+                                const T* e = s_elems + IPT * tt;
+                                int k = (e[3] < val) ? 3 : (e[2] < val) ? 2
+                                      : (e[1] < val) ? 1 : 0;
+                                res[i] = IPT * tt + k;
+                                break;
                             }
                         }
                     }
                 }
-                if (result >= 0) d_out[gid] = glb_offs + result;
             }
-            // Publish unresolved bits, one word per warp.  Unresolved
-            // elements get no d_out write here — Phase 3 writes them exactly
-            // once, so every output byte is written once total (the old
-            // INT_MIN sentinel forced a full d_out re-read in Phase 3).
-            unsigned um = __ballot_sync(0xffffffff, active && result < 0);
-            if (lane == 0)
-                d_unres[(unsigned)(glb_offs + ipt * BLOCK_SIZE + warp_id * 32) >> 5] = um;
+
+            if (active && res[i] >= 0) d_out[glb_offs + tbase + i] = glb_offs + res[i];
+            bal[i] = __ballot_sync(0xffffffff, active && res[i] < 0);
         }
 
-        // Publish warp-mins and block_min.  No leaf publish: the leaves of a
-        // complete block are byte-identical to d_in at the same offsets, so
-        // Phase 3 reads d_in directly (saves a 4-byte-per-element write).
-        if (lane == 0) {
-            T* g_wm = d_block_warp_mins + (size_t)block_id * W;
-            for (int ipt = 0; ipt < IPT; ipt++)
-                g_wm[ipt * NUM_WARPS + warp_id] = sm[ipt][warp_id];
+        // Publish unresolved bits (Phase 3 writes each unresolved d_out byte
+        // exactly once).  The word for chunk c of this warp packs the 4
+        // ballots' bytes c — element 4j+i of the chunk maps to bit 8i+j; the
+        // Phase 3 reader uses the same permutation (mybit).
+        if (lane < 32/8) {
+            unsigned word = ((bal[0] >> (8 * lane)) & 0xffu)
+                          | (((bal[1] >> (8 * lane)) & 0xffu) << 8)
+                          | (((bal[2] >> (8 * lane)) & 0xffu) << 16)
+                          | (((bal[3] >> (8 * lane)) & 0xffu) << 24);
+            d_unres[(unsigned)glb_offs / 32 + warp_id * (32/8) + lane] = word;
         }
 
-        // Reduce block_min using first warp across all IPT*NUM_WARPS stripe mins (W values)
-        if (warp_id == 0) {
-            T bmin = (lane < W) ? sm[lane / NUM_WARPS][lane % NUM_WARPS] : INF;
+        if (threadIdx.x == 0) {
+            T bmin = s_warp_min[0];
             #pragma unroll
-            for (int step = 16; step >= 1; step >>= 1)
-                bmin = min(bmin, __shfl_xor_sync(0xffffffff, bmin, step));
-            if (lane == 0) d_block_mins[block_id] = bmin;
+            for (int w = 1; w < NUM_WARPS; w++) bmin = min(bmin, s_warp_min[w]);
+            d_block_mins[block_id] = bmin;
         }
-        __syncthreads();  // s_elems/s_stripe_min still read above; next iteration overwrites
+        __syncthreads();  // shared reused next iteration
     }
 
     // -------------------------------------------------------------------------
@@ -2835,69 +2872,97 @@ void apsepKernelSPT(
     grid.sync();
 
     // -------------------------------------------------------------------------
-    // Phase 3: tree query + leaf scan for elements flagged in d_unres
+    // Phase 3: resolve elements flagged in d_unres, driven directly by the
+    // bitmask words (one word = 32 elements), warps grid-striding over words.
+    // No per-block sweep, no shared queue, no __syncthreads: a zero word is
+    // skipped after one cached read, so the fixed cost is the N/8-byte
+    // bitmask read instead of a B-element scan per logical block (measured
+    // ~1.2 ms of Phase 3 overhead on random/ascending at N=32M).
     // -------------------------------------------------------------------------
+    const int num_words   = (n + 31) >> 5;
+    const int warps_total = num_phys * NUM_WARPS;
+    const int mybit       = 8 * (lane & 3) + (lane >> 2);  // blocked-P1 bit permutation
 
-    for (int block_id = phys_bid; block_id < num_blocks; block_id += num_phys) {
-        const int glb_offs = block_id * B;
-        const T prefix_min_b = d_prefix_min[block_id];  // min(block_min[0..block_id-1])
+    // Each warp takes an aligned group of 32 consecutive words (one coalesced
+    // load; a group spans exactly 2 logical blocks, so the dense first-word-
+    // of-block bits distribute evenly across warps — a bare word stride of
+    // warps_total is a multiple of W and gave 1/W of the warps ALL the
+    // lookup work).  Nonzero words are then processed one per warp.
+    for (int wbase = (phys_bid * NUM_WARPS + warp_id) * 32;
+         wbase < num_words;
+         wbase += warps_total * 32) {
+        const int wl = wbase + lane;
+        const unsigned um_l = (wl < num_words) ? __ldg(&d_unres[wl]) : 0u;
 
-        // Whole-block early-out: unresolved elements within a block form a
-        // non-increasing sequence (were an earlier one smaller, the later one
-        // would have resolved intra-block), and the block's first element is
-        // always unresolved — so it is the max of all unresolved elements.
-        // If prefix_min_b >= that first element, every unresolved element in
-        // the block resolves to -1 (the descending worst case takes this path
-        // for all blocks).
-        if (prefix_min_b >= __ldg(&d_in[glb_offs])) {
-            for (int i = threadIdx.x; i < B; i += BLOCK_SIZE) {
-                int gid = glb_offs + i;
-                if (gid >= n) continue;
-                unsigned um = __ldg(&d_unres[(unsigned)gid >> 5]);
-                if ((um >> (gid & 31)) & 1u) d_out[gid] = -1;
-            }
+        // Per-lane metadata for this lane's word, loaded once per group and
+        // shuffled into the per-word loop (guard lanes are clamped; their
+        // words are never processed since um_l == 0).  eo_l is the
+        // whole-block early-out: unresolved elements within a block form a
+        // non-increasing sequence (were an earlier one smaller, the later
+        // one would have resolved intra-block), and the block's first
+        // element is always unresolved — so it is the max of them all.  If
+        // prefix_min beats it, every unresolved element in the block
+        // resolves to -1.
+        const int  bid_l = min(wl / W, num_blocks - 1);
+        const T    pm_l  = __ldg(&d_prefix_min[bid_l]);
+        const bool eo_l  = pm_l >= __ldg(&d_in[(size_t)bid_l * B]);
+
+        // Dense fast path (descending worst case): every word in the group
+        // fully unresolved and early-out — the whole 4 KB span is -1.
+        // Coalesced int4 stores, no per-word loop.
+        if (__all_sync(0xffffffff, eo_l && um_l == 0xffffffffu)) {
+            int4* out4 = reinterpret_cast<int4*>(d_out) + (size_t)wbase * 8 + lane;
+            const int4 m1 = make_int4(-1, -1, -1, -1);
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                out4[i * 32] = m1;
             continue;
         }
 
-        // Collect elements needing inter-block lookup into a shared queue,
-        // applying the O(1) prefix-min early exit inline.
-        if (threadIdx.x == 0) s_qcount = 0;
-        __syncthreads();
+        unsigned nz = __ballot_sync(0xffffffff, um_l != 0);
 
-        for (int i = threadIdx.x; i < B; i += BLOCK_SIZE) {
-            int gid = glb_offs + i;
-            if (gid >= n) continue;
-            unsigned um = __ldg(&d_unres[(unsigned)gid >> 5]);  // warp-uniform word
-            if (!((um >> (gid & 31)) & 1u)) continue;
+    while (nz) {
+        const int j = __ffs(nz) - 1;
+        nz &= nz - 1;
+        const unsigned um = __shfl_sync(0xffffffff, um_l, j);
+        const int w = wbase + j;
 
-            T val = d_in[gid];
-            if (prefix_min_b >= val) { d_out[gid] = -1; continue; }
-            s_queue[atomicAdd(&s_qcount, 1)] = i;
+        const int  block_id     = __shfl_sync(0xffffffff, bid_l, j);
+        const T    prefix_min_b = __shfl_sync(0xffffffff, pm_l, j);
+        const bool eo           = __shfl_sync(0xffffffff, (int)eo_l, j);
+        const int  base         = w * 32;
+        const bool mine         = (um >> mybit) & 1u;
+
+        if (eo) {
+            if (mine) d_out[base + lane] = -1;
+            continue;
         }
-        __syncthreads();
 
-        // Warp-cooperative processing, one queued element per warp.  The
-        // tree walk runs redundantly on all lanes (identical L2-cached
-        // addresses broadcast within the warp); the warp-min and leaf scans
-        // become two 32-wide coalesced loads + __ballot_sync instead of up
-        // to 48 dependent scalar loads with early exit.
-        const int qn = s_qcount;
-        for (int q = warp_id; q < qn; q += NUM_WARPS) {
-            int gid = glb_offs + s_queue[q];
-            T val = __ldg(&d_in[gid]);
+        const int gid = base + lane;
+        T val = mine ? __ldg(&d_in[gid]) : INF;    // coalesced masked load
+        const bool need = mine && (prefix_min_b < val);
+        if (mine && !need) d_out[gid] = -1;
 
-            // Ascent+descent on block-level tree
+        // Warp-cooperative lookup for each remaining bit, one at a time.
+        unsigned pend = __ballot_sync(0xffffffff, need);
+        while (pend) {
+            const int bit = __ffs(pend) - 1;
+            pend &= pend - 1;
+            const T qval = __shfl_sync(0xffffffff, val, bit);
+
+            // Ascent+descent on the block-level tree, redundant on all 32
+            // lanes (identical addresses broadcast from L2).
             int node = leaf_offset + block_id;
             int found_block = -1;
             while (node > 0) {
                 bool is_right = (node % 2 == 0);
                 if (is_right) {
                     int left_sib = node - 1;
-                    if (__ldg(&d_tree[left_sib]) < val) {
+                    if (__ldg(&d_tree[left_sib]) < qval) {
                         node = left_sib;
                         while (node < leaf_offset) {
                             int rc = 2 * node + 2;
-                            node = (__ldg(&d_tree[rc]) < val) ? rc : (2 * node + 1);
+                            node = (__ldg(&d_tree[rc]) < qval) ? rc : (2 * node + 1);
                         }
                         found_block = node - leaf_offset;
                         break;
@@ -2908,20 +2973,20 @@ void apsepKernelSPT(
 
             int result = -1;
             if (found_block >= 0) {
-                // found_block's block_min < val, so both ballots are nonzero.
+                // found_block's block_min < qval, so both ballots are nonzero.
                 const T* wm = d_block_warp_mins + (size_t)found_block * W;
                 T wv = (lane < W) ? __ldg(&wm[lane]) : INF;
-                unsigned wmask = __ballot_sync(0xffffffff, wv < val);
+                unsigned wmask = __ballot_sync(0xffffffff, wv < qval);
                 int wstar = 31 - __clz(wmask);
                 // found_block < block_id, so all B of its elements are < n:
                 // reading d_in here is safe and identical to the old leaves.
                 const T* bl = d_in + (size_t)found_block * B + wstar * 32;
-                unsigned lmask = __ballot_sync(0xffffffff, __ldg(&bl[lane]) < val);
+                unsigned lmask = __ballot_sync(0xffffffff, __ldg(&bl[lane]) < qval);
                 result = found_block * B + wstar * 32 + (31 - __clz(lmask));
             }
-            if (lane == 0) d_out[gid] = result;
+            if (lane == 0) d_out[base + bit] = result;
         }
-        __syncthreads();
+    }
     }
 }
 

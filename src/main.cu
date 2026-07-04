@@ -339,7 +339,7 @@ int main() {
     //             warp-min+leaf ~33 reads per inter-block element.
     // descending: 100% inter-block; WSTL ascends 16 levels with no match, no wm/leaf;
     //             SPT prefix-min fires for all -> 0 tree/wm/leaf reads.
-    // ascending:  0% inter-block; P3 trivially skips all elements (d_out != INT_MIN).
+    // ascending:  0% inter-block; P3 trivially skips all elements (zero bitmask words).
     const long long n_rand = (long long)(N * 0.013);  // ~1.3% measured
 
     // The min-tree (2*M-1 nodes, 524 KB) fits in L2 cache (1.5 MB), so tree reads
@@ -356,7 +356,7 @@ int main() {
             + (long long)N * 4                                    // P3 read d_out
             + n_rand * 4                                          // P3 read d_in (inter-block only)
             + n_rand * avg_wm_leaf_per_elem * 4,                 // P3 warp-min+leaf scan
-            // SPT random: d_in read only for unresolved elements (queue pass)
+            // SPT random: d_in read only for unresolved elements (bitmask-driven P3)
             spt_common
             + bm_bytes                                            // P3 read bitmask
             + n_rand * 4                                          // P3 read d_in (unresolved only)
