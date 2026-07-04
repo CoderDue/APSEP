@@ -14,19 +14,19 @@ Three-pass approach:
 2. *Pass 2*: build a segment min-tree over all block-mins (CPU-launched kernels, one per level).
 3. *Pass 3*: elements that did not resolve intra-block query the tree (ascent+descent, O(log N)) then do a warp-min + 32-leaf scan to find the exact answer.
 
-Random input: **~65 GB/s** (N=32M).
+Random input: **~65 GB/s** (N=32M). Kept as a reference implementation; SPT has superseded it on every input class.
 
 **SPT — SinglePassTree** (`runSPT` / `launchSPT`)
-Single cooperative kernel launched with `cudaLaunchCooperativeKernel`. 192 persistent physical blocks loop over all logical blocks in stride order, using `grid.sync()` to separate phases. Beyond the WSTL structure it adds: warp-uniform pointer-jumping for the within-warp ANSV, an unresolved-element bitmask (each output byte is written exactly once), an exclusive prefix-min computed by tree ascent, a whole-block early-out (`prefix_min >= first element` proves all unresolved answers are -1), and warp-cooperative Phase 3 queue processing. See `docs/spt_optimizations.md`.
+Single cooperative kernel launched with `cudaLaunchCooperativeKernel`. 192 persistent physical blocks loop over all logical blocks in stride order, using `grid.sync()` to separate phases. Beyond the WSTL structure it adds: a blocked Phase 1 layout (per-thread sequential ANSV in registers, warp machinery over per-thread mins), warp-uniform pointer jumping for the within-warp ANSV, an unresolved-element bitmask (each output byte is written exactly once), an exclusive prefix-min computed by tree ascent, a whole-block early-out (`prefix_min >= first element` proves all unresolved answers are -1), and a bitmask-driven warp-cooperative Phase 3 with a dense-word -1-fill fast path. See `docs/spt_optimizations.md`.
 
-Matches or beats WSTL on all inputs; descending (worst-case): **~117 GB/s** (N=32M), 1.8× WSTL.
+Beats WSTL on all inputs; descending (worst-case): **~182 GB/s** (N=32M), 2.8× WSTL.
 
 ## Performance (N=32M, GTX 1660 Ti, useful GB/s = 2·N·4 bytes / time)
 
 ```
                 random            descend            ascend
               WSTL    SPT       WSTL    SPT        WSTL    SPT
-33554432       65     64         64     117         107    107
+33554432       65     98         64     182         107    174
 ```
 
 ## Building
@@ -61,7 +61,9 @@ src/
   profile_*.cu           — historical profiling drivers
 docs/
   bottlenecks.md               — ncu profiling findings and bottleneck analysis
+  spt_design.md                — how SPT works and why it is close to its ceiling
   spt_optimizations.md         — SPT optimization log: what was tried, kept, rejected
   spt_early_out_regression.md  — block-max early-out regression and first-element fix
+  p3_word_striding_regression.md — Phase 3 word-stride load-balance regression and fix
 .claude-artifacts/       — temporary logs, ncu reports, build artifacts (not committed)
 ```

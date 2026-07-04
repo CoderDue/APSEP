@@ -83,14 +83,18 @@ At BLOCK_SIZE=128, IPT=4: B=512 elements/block, W=16 warp-mins/block, shared mem
 
 | Input     | WSTL     | SPT      |
 |-----------|----------|----------|
-| Random    | ~65 GB/s | ~64 GB/s |
-| Descending| ~64 GB/s | ~117 GB/s|
-| Ascending | ~107 GB/s| ~107 GB/s|
+| Random    | ~65 GB/s | ~98 GB/s |
+| Descending| ~64 GB/s | ~182 GB/s|
+| Ascending | ~107 GB/s| ~174 GB/s|
 
 "Useful GB/s" = 2×N×4 bytes / elapsed time (input read + output write only).
-SPT matches or beats WSTL on all inputs. See `docs/spt_optimizations.md` for
-the full optimization log (kept and rejected changes) and
-`docs/spt_early_out_regression.md` for the block-max regression writeup.
+Quote the N-sweep table from `apsep_test` as the reference (the fixed-N
+section runs at a different clock/thermal state). SPT beats WSTL on all
+inputs. See `docs/spt_optimizations.md` for the full optimization log (kept
+and rejected changes), `docs/spt_design.md` for how SPT works,
+`docs/spt_early_out_regression.md` for the block-max regression, and
+`docs/p3_word_striding_regression.md` for the Phase 3 word-stride
+load-balance regression.
 
 ## Bottleneck status
 
@@ -99,10 +103,14 @@ Resolved in SPT (see `docs/spt_optimizations.md`):
 2. ~~Low L2 sector utilization in Phase 3 leaf scan~~ — fixed by warp-cooperative Phase 3 (coalesced 32-wide loads + ballots).
 3. ~~Hillis-Steele prefix-min overhead~~ — replaced by single-pass tree-ascent prefix-min.
 4. ~~Write amplification (`d_block_leaves`)~~ — eliminated; Phase 3 reads `d_in` directly, and the unresolved bitmask means every `d_out` byte is written exactly once.
+5. ~~Phase 3 per-block sweep overhead~~ — replaced by bitmask-driven Phase 3 (aligned 32-word groups per warp) with a dense-word -1-fill fast path.
+6. ~~Striped Phase 1 shuffle cost~~ — replaced by blocked layout (in-register sequential ANSV + warp machinery over per-thread mins; −30% instructions on random).
 
-Remaining: SPT is latency-bound (ncu: DRAM 24–37% busy, SM 48–55%, no
-dominant stall — long_scoreboard/wait/barrier each ~20%). Measured dead ends:
-IPT=8, software prefetch, double-buffered shared memory, int4 loads (all
-regressed or were neutral; details in `docs/spt_optimizations.md`).
-`docs/bottlenecks.md` describes the pre-optimization state; WSTL still has
-bottlenecks 1, 2, and 4.
+Remaining: on random, SPT is still latency/instruction-bound (ncu: DRAM 36%
+busy, SM 45%, occupancy 95%, no dominant stall — wait/barrier/long_scoreboard
+each ~20%); on descending it is approaching bandwidth-bound (DRAM 62% busy,
+SM 28%). Measured dead ends: IPT=8, software prefetch, double-buffered shared
+memory, int4 loads on the striped layout (all regressed or were neutral;
+details in `docs/spt_optimizations.md`). `docs/bottlenecks.md` describes the
+pre-optimization state; WSTL still has bottlenecks 1, 2, and 4. SPT's Phase 1
+is IPT=4 / 4-byte-T specific (static_asserted).
