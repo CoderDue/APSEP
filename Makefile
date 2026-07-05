@@ -69,6 +69,30 @@ bench_spt_blocked: $(SPT_BLOCKED_TARGET)
 $(SPT_BLOCKED_TARGET): $(SPT_BLOCKED_SRC) src/apsep.cuh
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SPT_BLOCKED_SRC)
 
+SPT_P3TEAM_TARGET := bench_spt_p3team
+SPT_P3TEAM_SRC    := src/bench_spt_p3team.cu
+
+bench_spt_p3team: $(SPT_P3TEAM_TARGET)
+
+$(SPT_P3TEAM_TARGET): $(SPT_P3TEAM_SRC) src/apsep.cuh
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SPT_P3TEAM_SRC)
+
+SPT_IPT8_TARGET := bench_spt_ipt8
+SPT_IPT8_SRC    := src/bench_spt_ipt8.cu
+
+bench_spt_ipt8: $(SPT_IPT8_TARGET)
+
+$(SPT_IPT8_TARGET): $(SPT_IPT8_SRC) src/apsep.cuh
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SPT_IPT8_SRC)
+
+SPT_WARPAUTO_TARGET := bench_spt_warpauto
+SPT_WARPAUTO_SRC    := src/bench_spt_warpauto.cu
+
+bench_spt_warpauto: $(SPT_WARPAUTO_TARGET)
+
+$(SPT_WARPAUTO_TARGET): $(SPT_WARPAUTO_SRC) src/apsep.cuh
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(SPT_WARPAUTO_SRC)
+
 PROFILE_BN_TARGET := profile_bottleneck
 PROFILE_BN_SRC    := src/profile_bottleneck.cu
 
@@ -78,4 +102,7 @@ $(PROFILE_BN_TARGET): $(PROFILE_BN_SRC) src/apsep.cuh
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -o $@ $(PROFILE_BN_SRC)
 
 clean:
-	rm -f $(TARGET) $(BENCH_TARGET) $(PROFILE_TARGET) $(APPROACHES_TARGET) $(SWEEP_TARGET) $(SPT_WORST_TARGET) $(PROFILE_BN_TARGET)
+	rm -f $(TARGET) $(BENCH_TARGET) $(PROFILE_TARGET) $(PROFILE_WSNT_TARGET) \
+	      $(APPROACHES_TARGET) $(SWEEP_TARGET) $(SPT_WORST_TARGET) \
+	      $(SPT_PHASES_TARGET) $(SPT_BLOCKED_TARGET) $(SPT_P3TEAM_TARGET) \
+	      $(SPT_IPT8_TARGET) $(SPT_WARPAUTO_TARGET) $(PROFILE_BN_TARGET)
