@@ -109,8 +109,10 @@ Resolved in SPT (see `docs/spt_optimizations.md`):
 Remaining: on random, SPT is still latency/instruction-bound (ncu: DRAM 36%
 busy, SM 45%, occupancy 95%, no dominant stall — wait/barrier/long_scoreboard
 each ~20%); on descending it is approaching bandwidth-bound (DRAM 62% busy,
-SM 28%). Measured dead ends: IPT=8, software prefetch, double-buffered shared
-memory, int4 loads on the striped layout (all regressed or were neutral;
-details in `docs/spt_optimizations.md`). `docs/bottlenecks.md` describes the
+SM 28%). Measured dead ends: IPT=8 (both striped and blocked layouts),
+software prefetch, double-buffered shared memory, int4 loads on the striped
+layout, sub-warp-team Phase 3 lookups, warp-autonomous barrier-free Phase 1
+(all regressed or were neutral on random; details in
+`docs/spt_optimizations.md`). `docs/bottlenecks.md` describes the
 pre-optimization state; WSTL still has bottlenecks 1, 2, and 4. SPT's Phase 1
 is IPT=4 / 4-byte-T specific (static_asserted).

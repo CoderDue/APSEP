@@ -192,6 +192,38 @@ short_scoreboard 14% — same picture, fewer instructions.)
   reintroduced barrier + shared round-trip outweighed saving 3 load
   instructions; the scalar loads were already fully coalesced.
 
+Three follow-up prototypes after step 10 (all pass correctness; all kept
+8 blocks/SM with zero spills, so the losses are algorithmic; GB/s vs the
+same-run SPT baseline at N=32M, prototypes in `src/bench_spt_*.cu`):
+
+- **Sub-warp-team Phase 3** (`bench_spt_p3team`): split each Phase 3 warp
+  into 4 teams of 8 lanes so 4 tree lookups run concurrently (4 independent
+  latency chains per warp instead of 1). Random 81.1 → 77.6, ascending
+  171.4 → 167.9, descending flat. The 4× latency overlap did not pay for
+  the narrower probes: each lookup's chunk-min ballot covers W=16 with 8
+  lanes (2 mins/lane) and the leaf scan drops from 32-wide to 8-wide, so
+  per-lookup work goes up while the tree-walk itself (the serial part) is
+  unchanged. Serialized warp-cooperative lookups remain the better trade.
+- **IPT=8 on the blocked layout** (`bench_spt_ipt8`, B=1024, 47 regs,
+  4.6 KB smem): random 77.2 → 64.8, ascending 174.8 → 110.7, descending
+  flat. The striped-layout IPT=8 rejection (above) was re-tested because
+  the blocked layout changed the calculus — halving warp machinery per
+  element instead of doubling shuffle scans — but it still loses: the
+  O(IPT²) in-thread scan, longer exact-scan reads through shared, and
+  halved logical-block parallelism (32K blocks for 192 physical) cost more
+  than the halved warp machinery saves. IPT=8 is now rejected on *both*
+  layouts.
+- **Warp-autonomous Phase 1** (`bench_spt_warpauto`, one 128-element
+  logical block per warp, zero shared memory, zero `__syncthreads`, no
+  cross-warp fallback): random 88.3 → 65.8, ascending 174.3 → 114.9,
+  descending +2 (175.9, best descending measured). Removing the barrier
+  (21% of stalls) did help the barrier-free-friendly descending case, but
+  4× more logical blocks means a ~2 MB min-tree that no longer fits the
+  1.5 MB L2, ~4× more genuine Phase 3 lookups on random (unresolved
+  prefix-minima scale per-block), and 4× more prefix-min tree ascents.
+  The barrier was cheaper than the block-size reduction needed to remove
+  it.
+
 ## Why the kernel does not reach 80% of peak bandwidth
 
 `ncu` on the final kernel (step 10): random — DRAM busy 35.7%, SM 45%,
