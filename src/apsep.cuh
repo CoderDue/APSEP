@@ -2631,7 +2631,7 @@ void launchWSTL(const T* d_in, int* d_out, int n) {
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
-template <typename T, int BLOCK_SIZE, int IPT>
+template <typename T, int BLOCK_SIZE, int IPT, bool INCL = false>
 __global__
 void apsepKernelSPT(
         const T* __restrict__   d_in,
@@ -2666,6 +2666,12 @@ void apsepKernelSPT(
     static_assert(sizeof(T) == 4, "blocked Phase 1 assumes 4-byte T (int4 loads)");
     static_assert(W <= 32, "warp-cooperative Phase 3 assumes W <= 32");
 
+    // "a qualifies as the answer for query value b".  INCL=false is APSEP
+    // (strict previous-smaller); INCL=true is PSE(<=) (previous smaller or
+    // equal, e.g. LLP bracket matching / parent vectors).  Every query
+    // comparison in all three phases must go through this predicate.
+    auto lt = [](T a, T b) { return INCL ? (a <= b) : (a < b); };
+
     // -------------------------------------------------------------------------
     // Phase 1 (blocked layout): each thread owns IPT consecutive elements
     // (one int4 load), resolves within-thread matches sequentially in
@@ -2695,10 +2701,10 @@ void apsepKernelSPT(
         // In-thread sequential ANSV (block-relative result, -1 if none)
         int res[IPT];
         res[0] = -1;
-        res[1] = (v[0] < v[1]) ? tbase     : -1;
-        res[2] = (v[1] < v[2]) ? tbase + 1 : (v[0] < v[2]) ? tbase : -1;
-        res[3] = (v[2] < v[3]) ? tbase + 2 : (v[1] < v[3]) ? tbase + 1
-                                           : (v[0] < v[3]) ? tbase : -1;
+        res[1] = lt(v[0], v[1]) ? tbase     : -1;
+        res[2] = lt(v[1], v[2]) ? tbase + 1 : lt(v[0], v[2]) ? tbase : -1;
+        res[3] = lt(v[2], v[3]) ? tbase + 2 : lt(v[1], v[3]) ? tbase + 1
+                                            : lt(v[0], v[3]) ? tbase : -1;
 
         const T tmin = min(min(v[0], v[1]), min(v[2], v[3]));
         s_tmin[threadIdx.x] = tmin;
@@ -2730,14 +2736,14 @@ void apsepKernelSPT(
         // element-level algorithm carries over verbatim).
         int chain = -1;
         {
-            bool has = (lane > 0) && (carry < tmin);
+            bool has = (lane > 0) && lt(carry, tmin);
             if (__any_sync(0xffffffff, has)) {
                 int g = has ? lane - 1 : -1;
                 while (true) {
                     int src = (g >= 0) ? g : 0;
                     T   tg  = __shfl_sync(0xffffffff, tmin, src);
                     int gg  = __shfl_sync(0xffffffff, g,    src);
-                    bool jump = (g >= 0) && (tg >= tmin);
+                    bool jump = (g >= 0) && !lt(tg, tmin);
                     if (!__any_sync(0xffffffff, jump)) break;
                     if (jump) g = gg;
                 }
@@ -2754,25 +2760,25 @@ void apsepKernelSPT(
         for (int i = 0; i < IPT; i++) {
             const bool active = full || (glb_offs + tbase + i < n);
             const T val = v[i];
-            bool pending = active && (res[i] < 0) && (lane > 0) && (carry < val);
+            bool pending = active && (res[i] < 0) && (lane > 0) && lt(carry, val);
 
             if (__any_sync(0xffffffff, pending)) {
-                // Walk cur along the chain while tmin[cur] >= val.  Threads
-                // strictly between cur and lane always have tmin >= val, so
+                // Walk cur along the chain while !lt(tmin[cur], val).  Threads
+                // strictly between cur and lane never satisfy lt(tmin, val), so
                 // the walk cannot skip the answer; pending guarantees the
                 // answer exists, so cur lands on it (never -1).
                 while (true) {
                     int src = (pending && cur >= 0) ? cur : 0;
                     T   tg  = __shfl_sync(0xffffffff, tmin,  src);
                     int cg  = __shfl_sync(0xffffffff, chain, src);
-                    bool step = pending && (cur >= 0) && (tg >= val);
+                    bool step = pending && (cur >= 0) && !lt(tg, val);
                     if (!__any_sync(0xffffffff, step)) break;
                     if (step) cur = cg;
                 }
                 if (pending) {
                     int tt = warp_id * 32 + cur;
                     const T* e = s_elems + IPT * tt;
-                    int k = (e[3] < val) ? 3 : (e[2] < val) ? 2 : (e[1] < val) ? 1 : 0;
+                    int k = lt(e[3], val) ? 3 : lt(e[2], val) ? 2 : lt(e[1], val) ? 1 : 0;
                     res[i] = IPT * tt + k;
                 }
             }
@@ -2780,12 +2786,12 @@ void apsepKernelSPT(
             // Cross-warp fallback: warp min, then thread min, then exact.
             if (active && res[i] < 0) {
                 for (int w = warp_id - 1; w >= 0 && res[i] < 0; w--) {
-                    if (s_warp_min[w] < val) {
+                    if (lt(s_warp_min[w], val)) {
                         for (int tt = 32 * w + 31; tt >= 32 * w; tt--) {
-                            if (s_tmin[tt] < val) {
+                            if (lt(s_tmin[tt], val)) {
                                 const T* e = s_elems + IPT * tt;
-                                int k = (e[3] < val) ? 3 : (e[2] < val) ? 2
-                                      : (e[1] < val) ? 1 : 0;
+                                int k = lt(e[3], val) ? 3 : lt(e[2], val) ? 2
+                                      : lt(e[1], val) ? 1 : 0;
                                 res[i] = IPT * tt + k;
                                 break;
                             }
@@ -2901,11 +2907,11 @@ void apsepKernelSPT(
         // non-increasing sequence (were an earlier one smaller, the later
         // one would have resolved intra-block), and the block's first
         // element is always unresolved — so it is the max of them all.  If
-        // prefix_min beats it, every unresolved element in the block
-        // resolves to -1.
+        // prefix_min fails lt() against it, every unresolved element in the
+        // block resolves to -1 (holds for both < and <= semantics).
         const int  bid_l = min(wl / W, num_blocks - 1);
         const T    pm_l  = __ldg(&d_prefix_min[bid_l]);
-        const bool eo_l  = pm_l >= __ldg(&d_in[(size_t)bid_l * B]);
+        const bool eo_l  = !lt(pm_l, __ldg(&d_in[(size_t)bid_l * B]));
 
         // Dense fast path (descending worst case): every word in the group
         // fully unresolved and early-out — the whole 4 KB span is -1.
@@ -2940,7 +2946,7 @@ void apsepKernelSPT(
 
         const int gid = base + lane;
         T val = mine ? __ldg(&d_in[gid]) : INF;    // coalesced masked load
-        const bool need = mine && (prefix_min_b < val);
+        const bool need = mine && lt(prefix_min_b, val);
         if (mine && !need) d_out[gid] = -1;
 
         // Warp-cooperative lookup for each remaining bit, one at a time.
@@ -2958,11 +2964,11 @@ void apsepKernelSPT(
                 bool is_right = (node % 2 == 0);
                 if (is_right) {
                     int left_sib = node - 1;
-                    if (__ldg(&d_tree[left_sib]) < qval) {
+                    if (lt(__ldg(&d_tree[left_sib]), qval)) {
                         node = left_sib;
                         while (node < leaf_offset) {
                             int rc = 2 * node + 2;
-                            node = (__ldg(&d_tree[rc]) < qval) ? rc : (2 * node + 1);
+                            node = lt(__ldg(&d_tree[rc]), qval) ? rc : (2 * node + 1);
                         }
                         found_block = node - leaf_offset;
                         break;
@@ -2973,15 +2979,17 @@ void apsepKernelSPT(
 
             int result = -1;
             if (found_block >= 0) {
-                // found_block's block_min < qval, so both ballots are nonzero.
+                // lt(found_block's block_min, qval), so both ballots are nonzero.
                 const T* wm = d_block_warp_mins + (size_t)found_block * W;
                 T wv = (lane < W) ? __ldg(&wm[lane]) : INF;
-                unsigned wmask = __ballot_sync(0xffffffff, wv < qval);
+                // lane < W guard: under INCL, lt(INF, INT_MAX-valued qval)
+                // is true, so padding lanes must not enter the ballot.
+                unsigned wmask = __ballot_sync(0xffffffff, lane < W && lt(wv, qval));
                 int wstar = 31 - __clz(wmask);
                 // found_block < block_id, so all B of its elements are < n:
                 // reading d_in here is safe and identical to the old leaves.
                 const T* bl = d_in + (size_t)found_block * B + wstar * 32;
-                unsigned lmask = __ballot_sync(0xffffffff, __ldg(&bl[lane]) < qval);
+                unsigned lmask = __ballot_sync(0xffffffff, lt(__ldg(&bl[lane]), qval));
                 result = found_block * B + wstar * 32 + (31 - __clz(lmask));
             }
             if (lane == 0) d_out[base + bit] = result;
@@ -3003,7 +3011,7 @@ struct SPTScratch {
     int   num_phys          = 0;
 };
 
-template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4, bool INCL = false>
 SPTScratch<T, BLOCK_SIZE, IPT> allocSPTScratch(int n) {
     constexpr int B = BLOCK_SIZE * IPT;
     constexpr int W = B / 32;
@@ -3017,7 +3025,7 @@ SPTScratch<T, BLOCK_SIZE, IPT> allocSPTScratch(int n) {
     int blocks_per_sm = 0;
     gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm,
-        apsepKernelSPT<T, BLOCK_SIZE, IPT>,
+        apsepKernelSPT<T, BLOCK_SIZE, IPT, INCL>,
         BLOCK_SIZE, 0));
     cudaDeviceProp prop;
     gpuAssert(cudaGetDeviceProperties(&prop, 0));
@@ -3041,7 +3049,7 @@ void freeSPTScratch(SPTScratch<T, BLOCK_SIZE, IPT>& s) {
     s = SPTScratch<T, BLOCK_SIZE, IPT>{};
 }
 
-template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4, bool INCL = false>
 void runSPT(const T* d_in, int* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s) {
     if (n <= 0) return;
 
@@ -3053,16 +3061,16 @@ void runSPT(const T* d_in, int* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s)
         (void*)&s.d_prefix_min
     };
     gpuAssert(cudaLaunchCooperativeKernel(
-        (void*)apsepKernelSPT<T, BLOCK_SIZE, IPT>,
+        (void*)apsepKernelSPT<T, BLOCK_SIZE, IPT, INCL>,
         s.num_phys, BLOCK_SIZE, args, 0, nullptr));
     gpuAssert(cudaGetLastError());
 }
 
-template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
+template <typename T, int BLOCK_SIZE = 128, int IPT = 4, bool INCL = false>
 void launchSPT(const T* d_in, int* d_out, int n) {
     if (n <= 0) return;
-    auto s = allocSPTScratch<T, BLOCK_SIZE, IPT>(n);
-    runSPT<T, BLOCK_SIZE, IPT>(d_in, d_out, n, s);
+    auto s = allocSPTScratch<T, BLOCK_SIZE, IPT, INCL>(n);
+    runSPT<T, BLOCK_SIZE, IPT, INCL>(d_in, d_out, n, s);
     gpuAssert(cudaDeviceSynchronize());
     freeSPTScratch<T, BLOCK_SIZE, IPT>(s);
 }
